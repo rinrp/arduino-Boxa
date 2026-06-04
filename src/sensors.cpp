@@ -4,16 +4,16 @@
 //  sensors.cpp — Implementare senzori
 // ============================================================
 
- 
+  
 //  State intern buton
- 
+  
 static bool     s_prevButtonState     = HIGH;   // HIGH = neapăsat (INPUT_PULLUP)
 static unsigned long s_lastPressMs    = 0;
 
 
- 
+  
 //  Inițializare
- 
+  
 
 void sensors_init() {
     pinMode(REED_PIN,  INPUT_PULLUP);
@@ -22,9 +22,9 @@ void sensors_init() {
 }
 
 
- 
+  
 //  Reed switch
- 
+  
 
 bool door_isClosed() {
     return digitalRead(REED_PIN) == DOOR_CLOSED_STATE;
@@ -43,9 +43,9 @@ void door_printState() {
 }
 
 
- 
+  
 //  Buton cu debouncing
- 
+  
 
 bool button_wasPressed() {
     bool current = digitalRead(BUTON_PIN);

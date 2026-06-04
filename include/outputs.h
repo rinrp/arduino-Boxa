@@ -4,28 +4,13 @@
 #include <Arduino.h>
 #include "config.h"
 
-// ============================================================
-//  outputs.h — Control LED-uri și buzzer
-//
-//  Pini (din config.h):
-//    LED_VERDE_PIN   = D6
-//    LED_ROSU_PIN    = D7
-//    LED_ALBASTRU_PIN = D4
-//    BUZZER_PIN      = D5
-// ============================================================
 
-
- 
 //  Inițializare
- 
 
 /** Inițializează toți pinii de ieșire și stinge LED-urile. */
 void outputs_init();
 
-
- 
 //  LED-uri
- 
 
 void led_greenOn();
 void led_greenOff();
@@ -39,10 +24,9 @@ void led_blueOff();
 /** Stinge toate LED-urile simultan. */
 void led_allOff();
 
-
  
 //  Buzzer
- 
+  
 
 /**
  * Bip scurt de confirmare acces (1000 Hz, 200 ms).

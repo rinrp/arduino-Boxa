@@ -1,9 +1,18 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// ============================================================
+//  config.h — Singura sursă de adevăr pentru hardware și timing
+//
+//  Hardware: Arduino Uno (ATmega328P)
+//  NU modifica pinii în altă parte decât aici.
+// ============================================================
 
+
+  
 //  Pini hardware (conform configurației fizice)
- 
+  
+
 // Modem NB-IoT (rezervat, neutilizat în această versiune)
 #define MODEM_TX_PIN        2
 #define MODEM_RX_PIN        3
@@ -24,25 +33,31 @@
 #define BUTON_PIN           A1  // Buton deschidere manuală
 
 
- 
+  
 //  Logică senzor reed (reed KY-021 cu INPUT_PULLUP)
+//
 //  KY-021 cu magnet prezent (ușă închisă): contact închis → LOW
 //  KY-021 fără magnet (ușă deschisă):    contact deschis → HIGH
- 
+  
 #define DOOR_CLOSED_STATE   LOW
 #define DOOR_OPEN_STATE     HIGH
 
 
- 
+  
 //  Logică buton (INPUT_PULLUP, activ LOW)
- 
-#define BUTON_APАSAT        LOW
+  
+#define BUTON_APASAT        LOW
 #define BUTON_DEBOUNCE_MS   200UL
 
 
- 
+//  UID card autorizat (4 bytes, ex: CA:FD:A1:80)
+#define UID_VALID_LENGTH    4
+const byte UID_VALID[UID_VALID_LENGTH] = {0xCA, 0xFD, 0xA1, 0x80};
+
+
+  
 //  Timing state machine (milisecunde)
- 
+  
 
 // ACCESS_GRANTED: delay între LED verde și activarea yălii (LED albastru)
 #define DELAY_YALA_MS           1000UL
@@ -66,9 +81,9 @@
 #define STABILIZARE_MAX_MS      (DURATA_STABILIZARE_MS * 30UL)
 
 
- 
+  
 //  Buzzer — frecvențe și durate
- 
+  
 #define BUZZER_CONFIRM_FREQ     1000    // Hz — bip scurt de confirmare
 #define BUZZER_CONFIRM_DUR      200     // ms
 
@@ -84,9 +99,9 @@
 #define BUZZER_BUTON_INTERVAL   500UL   // ms între bipuri buton
 
 
- 
+  
 //  Serial debug
- 
+  
 #define SERIAL_BAUD             9600
 #define LOG_INTERVAL_MS         1000UL  // interval afișare stare reed
 

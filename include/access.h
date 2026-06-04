@@ -16,18 +16,18 @@
 // ============================================================
 
 
- 
+  
 //  Inițializare
 //  Apelați după SPI.begin() — sau lăsați access_init() să
 //  apeleze SPI.begin() intern (recomandat).
- 
+  
 
 void access_init();
 
 
- 
+  
 //  Citire card
- 
+  
 
 /**
  * Verifică dacă un card nou este prezent și citește UID-ul.

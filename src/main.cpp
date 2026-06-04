@@ -16,9 +16,9 @@
 // ============================================================
 
 
- 
+  
 //  Definiție stări
- 
+  
 
 enum State {
     IDLE,
@@ -29,9 +29,9 @@ enum State {
 };
 
 
- 
+  
 //  Variabile globale state machine
- 
+  
 
 static State         g_state             = IDLE;
 static unsigned long g_stateEntryMs      = 0;   // millis() la intrarea în stare
@@ -53,9 +53,9 @@ static unsigned long g_lastLogMs         = 0;
 static int           g_prevReedRaw       = -1;
 
 
- 
+  
 //  Helper: tranziție cu log
- 
+  
 
 static const __FlashStringHelper* stateName(State s) {
     switch (s) {
@@ -79,10 +79,10 @@ static void enterState(State next) {
 }
 
 
- 
+  
 //  Helper: terminare ciclu cu stabilizare
 //  Apelat când ușa s-a deschis ȘI s-a închis corect.
- 
+  
 
 static void beginStabilization() {
     led_allOff();

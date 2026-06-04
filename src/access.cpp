@@ -2,72 +2,67 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
- 
-// Definiții pini pentru modul RFID
- 
+// ============================================================
+//  access.cpp — Implementare RFID MFRC522 (Versiune Curată)
+// ============================================================
 
-#define RFID_SDA_PIN 10
-#define RFID_RST_PIN 9
-#define RFID_MOSI_PIN 11
-#define RFID_MISO_PIN 12
-#define RFID_SCK_PIN 13
+static MFRC522 s_mfrc522(RFID_SDA_PIN, RFID_RST_PIN);
 
-MFRC522 mfrc522(RFID_SDA_PIN, RFID_RST_PIN);
-
-// UID autorizat
-byte uidValid[4] = {0xCA, 0xFD, 0xA1, 0x80};
-
- 
-// Inițializare modul RFID
- 
-
+//  Inițializare
 void access_init() {
-  SPI.begin();
-  mfrc522.PCD_Init();
-  Serial.println("RFID: MFRC522 inițializat");
+    SPI.begin();
+    s_mfrc522.PCD_Init();
+    Serial.println(F("RFID: MFRC522 initializat (SDA=D10, RST=D9)"));
 }
 
- 
-// Citire și validare UID
- 
-
+//  Citire card
 bool access_isCardDetected() {
-  return mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial();
+    return s_mfrc522.PICC_IsNewCardPresent() &&
+           s_mfrc522.PICC_ReadCardSerial();
 }
 
 byte* access_getUID() {
-  return mfrc522.uid.uidByte;
+    return s_mfrc522.uid.uidByte;
 }
 
 byte access_getUIDLength() {
-  return mfrc522.uid.size;
+    return s_mfrc522.uid.size;
 }
 
+// Funcția corectată (folosește direct UID_VALID din config.h)
 bool access_isUIDValid() {
-  if (access_getUIDLength() != 4) {
-    return false;
-  }
-  for (byte i = 0; i < 4; i++) {
-    if (access_getUID()[i] != uidValid[i]) {
-      return false;
+    if (access_getUIDLength() != UID_VALID_LENGTH) return false;
+
+    const byte* uid = access_getUID();
+    for (byte i = 0; i < UID_VALID_LENGTH; i++) {
+        if (uid[i] != UID_VALID[i]) return false;
     }
-  }
-  return true;
+    return true;
 }
 
 void access_stopCommunication() {
-  mfrc522.PICC_HaltA();
-  mfrc522.PCD_StopCrypto1();
+    s_mfrc522.PICC_HaltA();
+    s_mfrc522.PCD_StopCrypto1();
+}
+
+void access_uidToString(char* out, size_t outSize) {
+    byte len = access_getUIDLength();
+    byte* uid = access_getUID();
+    size_t pos = 0;
+
+    for (byte i = 0; i < len && pos + 3 < outSize; i++) {
+        if (i > 0) out[pos++] = ':';
+        byte hi = (uid[i] >> 4) & 0x0F;
+        byte lo =  uid[i]       & 0x0F;
+        out[pos++] = hi < 10 ? '0' + hi : 'A' + hi - 10;
+        out[pos++] = lo < 10 ? '0' + lo : 'A' + lo - 10;
+    }
+    out[pos] = '\0';
 }
 
 void access_printUID() {
-  Serial.print("RFID: UID detectat:");
-  for (byte i = 0; i < access_getUIDLength(); i++) {
-    Serial.print(" ");
-    if (access_getUID()[i] < 0x10) {
-      Serial.print('0');
-    }
-    Serial.print(access_getUID()[i], HEX);
-  }
-  Serial.println();
+    char buf[32];
+    access_uidToString(buf, sizeof(buf));
+    Serial.print(F("RFID: UID="));
+    Serial.println(buf);
 }
