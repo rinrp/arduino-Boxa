@@ -21,13 +21,10 @@ void led_redOff();
 void led_blueOn();
 void led_blueOff();
 
-/** Stinge toate LED-urile simultan. */
 void led_allOff();
 
  
 //  Buzzer
-  
-
 /**
  * Bip scurt de confirmare acces (1000 Hz, 200 ms).
  * Blocker — ocupă ~200ms din execuție.

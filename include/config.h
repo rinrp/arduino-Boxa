@@ -85,10 +85,10 @@ const byte UID_VALID[UID_VALID_LENGTH] = {0xCA, 0xFD, 0xA1, 0x80};
 //  Buzzer — frecvențe și durate
   
 #define BUZZER_CONFIRM_FREQ     1000    // Hz — bip scurt de confirmare
-#define BUZZER_CONFIRM_DUR      200     // ms
+#define BUZZER_CONFIRM_DUR      150     // ms
 
 #define BUZZER_ERROR_FREQ       300     // Hz — sunet jos, eroare
-#define BUZZER_ERROR_DUR        1200    // ms
+#define BUZZER_ERROR_DUR        800    // ms
 
 #define BUZZER_ALARM_FREQ       800     // Hz — alarmă intermitentă
 #define BUZZER_ALARM_DUR        250     // ms
@@ -99,7 +99,6 @@ const byte UID_VALID[UID_VALID_LENGTH] = {0xCA, 0xFD, 0xA1, 0x80};
 #define BUZZER_BUTON_INTERVAL   500UL   // ms între bipuri buton
 
 
-  
 //  Serial debug
   
 #define SERIAL_BAUD             9600

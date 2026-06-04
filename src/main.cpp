@@ -4,19 +4,7 @@
 #include "outputs.h"
 #include "access.h"
 
-// ============================================================
-//  main.cpp — State machine sistem control acces
-//
-//  Stări:
-//    IDLE          → sistem armat, monitorizare normală
-//    ACCESS_GRANTED → card valid, yală activată
-//    ACCESS_DENIED  → card invalid, semnal eroare
-//    TEMP_OPEN      → deschidere manuală prin buton
-//    ALARM          → ușă forțată, alarmă activă
-// ============================================================
 
-
-  
 //  Definiție stări
   
 
@@ -89,7 +77,7 @@ static void beginStabilization() {
     g_stabilizing       = true;
     g_stabilizeStartMs  = millis();
     enterState(IDLE);
-    Serial.println(F("Stabilizare 2s activa..."));
+    Serial.println(F("Stabilizare activa..."));
 }
 
 
@@ -111,10 +99,9 @@ void setup() {
 
     led_allOff();
 
-    Serial.println(F("Initializare completa. Stare: IDLE"));
+    Serial.println(F("Initializare completa"));
     Serial.println();
 }
-
 
 // ============================================================
 //  loop()
@@ -129,10 +116,10 @@ void loop() {
     int reedRaw = digitalRead(REED_PIN);
     if (reedRaw != g_prevReedRaw) {
         g_prevReedRaw = reedRaw;
-        Serial.print(F("REED raw="));
+        Serial.print(F("STATUS="));
         Serial.print(reedRaw);
-        Serial.print(F("  usa="));
-        Serial.print(door_isOpen() ? F("DESCHISA") : F("INCHISA"));
+        Serial.print(F("  UȘA="));
+        Serial.print(door_isOpen() ? F("DESCHISĂ") : F("INCHISĂ"));
         Serial.print(F("  state="));
         Serial.println(stateName(g_state));
     }
@@ -157,7 +144,7 @@ void loop() {
         } else if (now - g_stabilizeStartMs > STABILIZARE_MAX_MS) {
             // Watchdog de siguranță
             g_stabilizing = false;
-            Serial.println(F("WARN: stabilizare reset fortat"));
+            Serial.println(F("AVERTIZARE: stabilizare reset fortat"));
         }
         return;  // <-- NU procesăm nicio stare în timpul stabilizării
     }
@@ -212,7 +199,7 @@ void loop() {
             // --- Ușă forțată (alarmă) ---
             // Verificăm DUPĂ stabilizare (return mai sus garantează asta)
             if (door_isOpen()) {
-                Serial.println(F("ALARMA: usa fortata in IDLE!"));
+                Serial.println(F("ALARMA: Ușa forțată!"));
                 led_redOn();
                 buzzer_alarmStart();
                 enterState(ALARM);
@@ -227,7 +214,7 @@ void loop() {
         //  Faza 1 (0 → DELAY_YALA_MS):     LED verde aprins
         //  Faza 2 (DELAY_YALA_MS → +):     LED verde + albastru (yală activă)
         //    → dacă ușa se deschide și se închide: stabilizare → IDLE
-        //    → dacă timeout TIMEOUT_ASTEPTARE_USA_MS fără deschidere: IDLE
+        //    → dacă timeout   TIMEOUT_ASTEPTARE_USA_MS fără deschidere: IDLE
         //    → dacă ușa e forțată: ALARM
         // ======================================================
 
@@ -261,7 +248,7 @@ void loop() {
                 // Timeout: ușa nu s-a deschis deloc
                 if (!g_doorOpenedInCycle &&
                     now - g_yalaActivatedMs >= TIMEOUT_ASTEPTARE_USA_MS) {
-                    Serial.println(F("Timeout: usa nu s-a deschis -> IDLE"));
+                    Serial.println(F("Timeout: usa nu s-a deschis"));
                     led_allOff();
                     g_yalaActive = false;
                     enterState(IDLE);
@@ -295,7 +282,7 @@ void loop() {
 
             // Ușă forțată în timp ce cardul era invalid
             if (door_isOpen()) {
-                Serial.println(F("ALARMA: usa fortata in ACCESS_DENIED!"));
+                Serial.println(F("ALARMA: Ușa fortata in ACCESS_DENIED!"));
                 buzzer_alarmStart();
                 enterState(ALARM);
             }
@@ -322,7 +309,7 @@ void loop() {
 
             // Ușă deschisă → închisă
             if (g_doorOpenedByBtn && door_isClosed()) {
-                Serial.println(F("Usa inchisa dupa buton -> stabilizare"));
+                Serial.println(F("Usa inchisa dupa buton"));
                 noTone(BUZZER_PIN);
                 beginStabilization();
                 g_doorOpenedByBtn = false;
@@ -331,7 +318,7 @@ void loop() {
 
             // Timeout fără utilizare
             if (now - g_stateEntryMs >= TIMEOUT_BUTON_MS) {
-                Serial.println(F("Buton timeout: usa neutilizata -> IDLE"));
+                Serial.println(F("Buton timeout: usa neutilizată"));
                 noTone(BUZZER_PIN);
                 led_blueOff();
                 g_doorOpenedByBtn = false;
@@ -353,7 +340,7 @@ void loop() {
             buzzer_alarmTick();
 
             if (door_isClosed()) {
-                Serial.println(F("Usa inchisa -> alarma oprita -> IDLE"));
+                Serial.println(F("Usa inchisa -> alarma oprita"));
                 buzzer_alarmStop();
                 led_redOff();
                 enterState(IDLE);

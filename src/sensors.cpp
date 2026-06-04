@@ -36,9 +36,9 @@ bool door_isOpen() {
 
 void door_printState() {
     if (door_isClosed()) {
-        Serial.println(F("Reed: usa INCHISA"));
+        Serial.println(F("Statut: Ușă ÎNCHISĂ"));
     } else {
-        Serial.println(F("Reed: usa DESCHISA"));
+        Serial.println(F("Statut: Ușă DESCHISĂ"));
     }
 }
 
