@@ -1,256 +1,365 @@
 #include <Arduino.h>
+#include "config.h"
 #include "sensors.h"
-#include "access.h"
 #include "outputs.h"
-#include "nb_iot.h"
+#include "access.h"
 
-// ============================================================================
-// Stări pentru State Machine   
+// ============================================================
+//  main.cpp — State machine sistem control acces
+//
+//  Stări:
+//    IDLE          → sistem armat, monitorizare normală
+//    ACCESS_GRANTED → card valid, yală activată
+//    ACCESS_DENIED  → card invalid, semnal eroare
+//    TEMP_OPEN      → deschidere manuală prin buton
+//    ALARM          → ușă forțată, alarmă activă
+// ============================================================
 
-enum StareSistem {
-  IDLE,           // Stare armată, monitorizare normală
-  ACCESS_GRANTED, // Acces permis prin card valid
-  ACCESS_DENIED,  // Card invalid
-  TEMP_OPEN,      // Deschidere temporară prin buton
-  ALARM           // Alarmă activă
+
+ 
+//  Definiție stări
+ 
+
+enum State {
+    IDLE,
+    ACCESS_GRANTED,
+    ACCESS_DENIED,
+    TEMP_OPEN,
+    ALARM
 };
 
-// ============================================================================
-// Variabile globale pentru gestionarea stărilor
 
-StareSistem stareCurenta = IDLE;
+ 
+//  Variabile globale state machine
+ 
 
-unsigned long timpStartDeschidere = 0;
-const unsigned long delayDeschidereYala = 1000;   // 1 secundă până la aprinderea LED albastru pentru card valid
-const unsigned long durataAsteptareDeschidere = 6000; // 6 secunde pentru detectarea deschiderii după LED albastru aprins
-const unsigned long durataRefuzCard = 2000;       // 2 secunde LED roșu pentru card invalid
-const unsigned long durataBeepsButon = 9000;     // 9 secunde beep pentru buton
+static State         g_state             = IDLE;
+static unsigned long g_stateEntryMs      = 0;   // millis() la intrarea în stare
 
-unsigned long timpUltimBip = 0;
-const unsigned long intervalBip = 500;
-bool buttonBeepsActive = false;
-unsigned long timpBlueOn = 0;
+// ACCESS_GRANTED
+static bool          g_yalaActive        = false;  // true după delay yală
+static unsigned long g_yalaActivatedMs   = 0;
+static bool          g_doorOpenedInCycle = false;
 
-bool usaDeschisaInCiclu = false;
-bool cardBlueOn = false;
+// TEMP_OPEN
+static bool          g_doorOpenedByBtn   = false;
 
-bool stabilizareActiva = false;
-unsigned long timpStabilizareStart = 0;
-const unsigned long durataStabilizare = 2000;  // 2 secunde de filtrare la închidere
-// ============================================================================
-// Variabile pentru modul "Ieșire Autorizată" (buton)
-// ============================================================================
-bool exitAuthorized = false;   // true = alarma este inhibată pentru ieșire
-bool exitDoorOpened = false;   // detectează că ușa s-a deschis după buton
+// Stabilizare la închiderea ușii
+static bool          g_stabilizing       = false;
+static unsigned long g_stabilizeStartMs  = 0;
 
-unsigned long ultimulTimpAfisare = 0;
-const unsigned long intervalAfisare = 1000;
+// Log periodic reed
+static unsigned long g_lastLogMs         = 0;
+static int           g_prevReedRaw       = -1;
 
-// ============================================================================
-// Setup
 
-void setup() {
-  Serial.begin(9600);
-  while (!Serial);
+ 
+//  Helper: tranziție cu log
+ 
 
-  Serial.println("====================================");
-  Serial.println("Sistem pornit - Control acces RFID");
-  Serial.println("====================================");
-
-  access_init();
-  led_init();
-  buzzer_init();
-  magneticSensor_init();
-  button_init();
-
-  // Asigură LED-urile stinse la pornire
-  led_blueOff();
-  led_greenOff();
-  led_redOff();
-
-  initModem();
-  if (connectNetwork()) {
-    sendData("NB-IoT OK");
-  } else {
-    Serial.println(F("NB-IoT: network connect failed"));
-  }
-
-  Serial.println("Inițializare completă. Sistem în stare IDLE.");
-  Serial.println();
+static const __FlashStringHelper* stateName(State s) {
+    switch (s) {
+        case IDLE:           return F("IDLE");
+        case ACCESS_GRANTED: return F("ACCESS_GRANTED");
+        case ACCESS_DENIED:  return F("ACCESS_DENIED");
+        case TEMP_OPEN:      return F("TEMP_OPEN");
+        case ALARM:          return F("ALARM");
+        default:             return F("?");
+    }
 }
 
-// ============================================================================
-// Loop
+static void enterState(State next) {
+    if (next == g_state) return;
+    Serial.print(F("STATE: "));
+    Serial.print(stateName(g_state));
+    Serial.print(F(" -> "));
+    Serial.println(stateName(next));
+    g_state        = next;
+    g_stateEntryMs = millis();
+}
+
+
+ 
+//  Helper: terminare ciclu cu stabilizare
+//  Apelat când ușa s-a deschis ȘI s-a închis corect.
+ 
+
+static void beginStabilization() {
+    led_allOff();
+    g_stabilizing       = true;
+    g_stabilizeStartMs  = millis();
+    enterState(IDLE);
+    Serial.println(F("Stabilizare 2s activa..."));
+}
+
+
+// ============================================================
+//  setup()
+// ============================================================
+
+void setup() {
+    Serial.begin(SERIAL_BAUD);
+    while (!Serial);
+
+    Serial.println(F("===================================="));
+    Serial.println(F("  Sistem control acces RFID v2.0   "));
+    Serial.println(F("===================================="));
+
+    access_init();
+    outputs_init();
+    sensors_init();
+
+    led_allOff();
+
+    Serial.println(F("Initializare completa. Stare: IDLE"));
+    Serial.println();
+}
+
+
+// ============================================================
+//  loop()
+// ============================================================
 
 void loop() {
-  if (millis() - ultimulTimpAfisare > intervalAfisare) {
-    ultimulTimpAfisare = millis();
-    magneticSensor_printState();
-  }
-  // Gestionare modul Ieșire Autorizată: rearmează când ușa se închide după deschidere
-  if (exitAuthorized) {
-    if (magneticSensor_isDoorOpen()) {
-      exitDoorOpened = true;
+    unsigned long now = millis();
+
+    // ----------------------------------------------------------
+    // 1. Detectare schimbare reed (debug serial)
+    // ----------------------------------------------------------
+    int reedRaw = digitalRead(REED_PIN);
+    if (reedRaw != g_prevReedRaw) {
+        g_prevReedRaw = reedRaw;
+        Serial.print(F("REED raw="));
+        Serial.print(reedRaw);
+        Serial.print(F("  usa="));
+        Serial.print(door_isOpen() ? F("DESCHISA") : F("INCHISA"));
+        Serial.print(F("  state="));
+        Serial.println(stateName(g_state));
     }
-    if (exitDoorOpened && magneticSensor_isDoorClosed()) {
-      exitAuthorized = false;
-      exitDoorOpened = false;
-      Serial.println("Ușă închisă după acționare buton. Sistem re-armat");
+
+    // ----------------------------------------------------------
+    // 2. Log periodic stare ușă
+    // ----------------------------------------------------------
+    if (now - g_lastLogMs >= LOG_INTERVAL_MS) {
+        g_lastLogMs = now;
+        door_printState();
     }
-  }
 
-  if (stabilizareActiva) {
-    if (millis() - timpStabilizareStart >= durataStabilizare) {
-      stabilizareActiva = false;
-      // La finalul perioadei de stabilizare stinge toate LED-urile (albastru + verde + roșu)
-      led_blueOff();
-      led_greenOff();
-      led_redOff();
-      Serial.println("Sistem ARMAT");
+    // ----------------------------------------------------------
+    // 3. Perioadă de stabilizare post-închidere
+    //    Ignoră orice eveniment de alarmă în această fereastră.
+    // ----------------------------------------------------------
+    if (g_stabilizing) {
+        if (now - g_stabilizeStartMs >= DURATA_STABILIZARE_MS) {
+            g_stabilizing = false;
+            led_allOff();
+            Serial.println(F("Sistem ARMAT"));
+        } else if (now - g_stabilizeStartMs > STABILIZARE_MAX_MS) {
+            // Watchdog de siguranță
+            g_stabilizing = false;
+            Serial.println(F("WARN: stabilizare reset fortat"));
+        }
+        return;  // <-- NU procesăm nicio stare în timpul stabilizării
     }
-  }
 
-  switch (stareCurenta) {
-    case IDLE:
-      // În stare de veghe: asigură LED-urile stinse
-      led_blueOff();
-      led_greenOff();
-      led_redOff();
-      if (access_isCardDetected()) {
-        access_printUID();
+    // ----------------------------------------------------------
+    // 4. State machine
+    // ----------------------------------------------------------
 
-        if (access_isUIDValid()) {
-          Serial.println("Card valid");
-          led_greenOn();
-          buzzer_confirmSound();
-          stareCurenta = ACCESS_GRANTED;
-          timpStartDeschidere = millis();
-          cardBlueOn = false;
-          usaDeschisaInCiclu = false;
-        } else {
-          Serial.println("Acces Respins");
-          led_redOn();
-          buzzer_errorSound();
-          stareCurenta = ACCESS_DENIED;
-          timpStartDeschidere = millis();
-        }
+    switch (g_state) {
 
-        access_stopCommunication();
-      }
+        // ======================================================
+        case IDLE:
+        // ======================================================
+        //  LED-uri: toate stinse
+        //  Monitorizează: card RFID, buton, ușă forțată
+        // ======================================================
 
-      if (button_isPressed()) {
-        Serial.println("Buton acționat: Deschiderea ușii...");
-        led_blueOn();
-        buttonBeepsActive = true;
-        timpUltimBip = millis();
-        timpStartDeschidere = millis();
-        stareCurenta = TEMP_OPEN;
-        usaDeschisaInCiclu = false;
-      }
+            led_allOff();
 
-      if (!stabilizareActiva && magneticSensor_isDoorOpen()) {
-        Serial.println("Alarmă: Ușă deschisă fortat");
-        led_redOn();
-        buzzer_alarmStart();
-        stareCurenta = ALARM;
-      }
-      break;
+            // --- Card RFID ---
+            if (access_isCardDetected()) {
+                access_printUID();
 
-    case ACCESS_GRANTED:
-      led_greenOn();
+                if (access_isUIDValid()) {
+                    // Card valid: LED verde + bip confirmare → ACCESS_GRANTED
+                    Serial.println(F("Card: VALID - acces permis"));
+                    led_greenOn();
+                    buzzer_confirmSound();
 
-      if (!cardBlueOn && millis() - timpStartDeschidere >= delayDeschidereYala) {
-        led_blueOn();
-        cardBlueOn = true;
-        timpBlueOn = millis();
-        usaDeschisaInCiclu = false;
-        Serial.println("Yală activată - LED albastru aprins");
-      }
+                    g_yalaActive        = false;
+                    g_doorOpenedInCycle = false;
+                    enterState(ACCESS_GRANTED);
+                } else {
+                    // Card invalid: LED roșu + bip eroare → ACCESS_DENIED
+                    Serial.println(F("Card: INVALID - acces refuzat"));
+                    led_redOn();
+                    buzzer_errorSound();
+                    enterState(ACCESS_DENIED);
+                }
 
-      if (cardBlueOn) {
-        if (magneticSensor_isDoorOpen()) {
-          usaDeschisaInCiclu = true;
-        }
+                access_stopCommunication();
+            }
 
-        if (usaDeschisaInCiclu && magneticSensor_isDoorClosed()) {
-          Serial.println("Ușă închisă. Se activează perioada de stabilizare de 2 secunde...");
-          led_blueOff();
-          stabilizareActiva = true;
-          timpStabilizareStart = millis();
-          stareCurenta = IDLE;
-          cardBlueOn = false;
-          usaDeschisaInCiclu = false;
-          break;
-        }
+            // --- Buton deschidere manuală ---
+            if (button_wasPressed()) {
+                Serial.println(F("Buton: deschidere manuala"));
+                led_blueOn();
+                g_doorOpenedByBtn = false;
+                enterState(TEMP_OPEN);
+            }
 
-        if (!usaDeschisaInCiclu && millis() - timpBlueOn >= durataAsteptareDeschidere) {
-          Serial.println("Timp expirat: Ușa nu a fost deschisă. Re-armare automată");
-          led_blueOff();
-          led_greenOff();
-          stareCurenta = IDLE;
-          cardBlueOn = false;
-          usaDeschisaInCiclu = false;
-        }
-      }
-      break;
+            // --- Ușă forțată (alarmă) ---
+            // Verificăm DUPĂ stabilizare (return mai sus garantează asta)
+            if (door_isOpen()) {
+                Serial.println(F("ALARMA: usa fortata in IDLE!"));
+                led_redOn();
+                buzzer_alarmStart();
+                enterState(ALARM);
+            }
 
-    case ACCESS_DENIED:
-      led_redOn();
+            break;
 
-      if (millis() - timpStartDeschidere >= durataRefuzCard) {
-        led_redOff();
-        Serial.println("Sistem re-armat automat - Card invalid finalizat");
-        stareCurenta = IDLE;
-      }
 
-      if (magneticSensor_isDoorOpen()) {
-        Serial.println("Alarmă: Ușă deschisă fortat");
-        buzzer_alarmStart();
-        stareCurenta = ALARM;
-      }
-      break;
+        // ======================================================
+        case ACCESS_GRANTED:
+        // ======================================================
+        //  Faza 1 (0 → DELAY_YALA_MS):     LED verde aprins
+        //  Faza 2 (DELAY_YALA_MS → +):     LED verde + albastru (yală activă)
+        //    → dacă ușa se deschide și se închide: stabilizare → IDLE
+        //    → dacă timeout TIMEOUT_ASTEPTARE_USA_MS fără deschidere: IDLE
+        //    → dacă ușa e forțată: ALARM
+        // ======================================================
 
-    case TEMP_OPEN:
-      led_blueOn();
+            led_greenOn();
 
-      if (buttonBeepsActive) {
-        if (millis() - timpStartDeschidere < durataBeepsButon) {
-          if (millis() - timpUltimBip >= intervalBip) {
-            tone(BUZZER_PIN, 800, 80);
-            timpUltimBip = millis();
-          }
-        } else {
-          buttonBeepsActive = false;
-          noTone(BUZZER_PIN);
-          led_blueOff();
-          Serial.println("Sistem re-armat automat - Ușă neutilizată");
-          stareCurenta = IDLE;
-        }
-      }
+            // Faza 1→2: activare yală după delay
+            if (!g_yalaActive &&
+                now - g_stateEntryMs >= DELAY_YALA_MS) {
+                led_blueOn();
+                g_yalaActive      = true;
+                g_yalaActivatedMs = now;
+                g_doorOpenedInCycle = false;
+                Serial.println(F("Yala activa (LED albastru)"));
+            }
 
-      if (magneticSensor_isDoorOpen()) {
-        usaDeschisaInCiclu = true;
-      }
-      if (usaDeschisaInCiclu && magneticSensor_isDoorClosed()) {
-        Serial.println("Ușă închisă - Sistem rearmată imediat");
-        buttonBeepsActive = false;
-        noTone(BUZZER_PIN);
-        led_blueOff();
-        stareCurenta = IDLE;
-        usaDeschisaInCiclu = false;
-      }
-      break;
+            if (g_yalaActive) {
+                // Urmărim dacă ușa s-a deschis
+                if (door_isOpen()) {
+                    g_doorOpenedInCycle = true;
+                }
 
-    case ALARM:
-      led_redOn();
-      buzzer_alarmManage();
+                // Ușă deschisă → închisă: acces completat
+                if (g_doorOpenedInCycle && door_isClosed()) {
+                    Serial.println(F("Usa inchisa dupa acces valid -> stabilizare"));
+                    beginStabilization();
+                    g_yalaActive        = false;
+                    g_doorOpenedInCycle = false;
+                    break;
+                }
 
-      if (magneticSensor_isDoorClosed()) {
-        Serial.println("Ușă închisă - Sistem asigurat");
-        buzzer_alarmStop();
-        led_redOff();
-        stareCurenta = IDLE;
-      }
-      break;
-  }
+                // Timeout: ușa nu s-a deschis deloc
+                if (!g_doorOpenedInCycle &&
+                    now - g_yalaActivatedMs >= TIMEOUT_ASTEPTARE_USA_MS) {
+                    Serial.println(F("Timeout: usa nu s-a deschis -> IDLE"));
+                    led_allOff();
+                    g_yalaActive = false;
+                    enterState(IDLE);
+                    break;
+                }
+
+                // Ușă forțată (yală era activă dar ușa n-a trebuit să fie deschisă)
+                // Acoperit implicit: dacă doorOpenedInCycle e true și ușa rămâne
+                // deschisă mai mult decât normal, nu declanșăm alarmă — e o
+                // deschidere autorizată în curs. Alarma se declanșează în IDLE.
+            }
+
+            break;
+
+
+        // ======================================================
+        case ACCESS_DENIED:
+        // ======================================================
+        //  LED roșu aprins DURATA_REFUZ_CARD_MS, apoi IDLE.
+        //  Dacă ușa se deschide în acest interval: ALARM.
+        // ======================================================
+
+            led_redOn();
+
+            // Timeout → re-armare
+            if (now - g_stateEntryMs >= DURATA_REFUZ_CARD_MS) {
+                Serial.println(F("Card invalid: timeout -> IDLE"));
+                led_redOff();
+                enterState(IDLE);
+            }
+
+            // Ușă forțată în timp ce cardul era invalid
+            if (door_isOpen()) {
+                Serial.println(F("ALARMA: usa fortata in ACCESS_DENIED!"));
+                buzzer_alarmStart();
+                enterState(ALARM);
+            }
+
+            break;
+
+
+        // ======================================================
+        case TEMP_OPEN:
+        // ======================================================
+        //  LED albastru + beep periodic TIMEOUT_BUTON_MS.
+        //  Dacă ușa se deschide și se închide: stabilizare → IDLE.
+        //  Dacă timeout fără deschidere: IDLE (re-armare automată).
+        //  Nu se declanșează alarmă în TEMP_OPEN (deschidere autorizată).
+        // ======================================================
+
+            led_blueOn();
+            buzzer_buttonTick(now, g_stateEntryMs);
+
+            // Urmărim deschiderea ușii
+            if (door_isOpen()) {
+                g_doorOpenedByBtn = true;
+            }
+
+            // Ușă deschisă → închisă
+            if (g_doorOpenedByBtn && door_isClosed()) {
+                Serial.println(F("Usa inchisa dupa buton -> stabilizare"));
+                noTone(BUZZER_PIN);
+                beginStabilization();
+                g_doorOpenedByBtn = false;
+                break;
+            }
+
+            // Timeout fără utilizare
+            if (now - g_stateEntryMs >= TIMEOUT_BUTON_MS) {
+                Serial.println(F("Buton timeout: usa neutilizata -> IDLE"));
+                noTone(BUZZER_PIN);
+                led_blueOff();
+                g_doorOpenedByBtn = false;
+                enterState(IDLE);
+            }
+
+            break;
+
+
+        // ======================================================
+        case ALARM:
+        // ======================================================
+        //  LED roșu + buzzer intermitent.
+        //  Oprire DOAR când ușa se închide.
+        //  (Varianta extinsă: adăugați un PIN pentru cheie de dezarmare.)
+        // ======================================================
+
+            led_redOn();
+            buzzer_alarmTick();
+
+            if (door_isClosed()) {
+                Serial.println(F("Usa inchisa -> alarma oprita -> IDLE"));
+                buzzer_alarmStop();
+                led_redOff();
+                enterState(IDLE);
+            }
+
+            break;
+
+    } // switch
 }

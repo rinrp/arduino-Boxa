@@ -1,114 +1,109 @@
 #include "outputs.h"
 
-// ============================================================================
-// Variabile buzzer pentru alarmă
-// ============================================================================
+// ============================================================
+//  outputs.cpp — Implementare ieșiri
+// ============================================================
 
-unsigned long timpUltimSunetAlarma = 0;
-const unsigned long intervalAlarma = 500;
-bool alarmActive = false;
+ 
+//  State intern alarma
+ 
+static bool          s_alarmActive      = false;
+static unsigned long s_lastAlarmTick    = 0;
 
-// ============================================================================
-// Helper intern
-// ============================================================================
+// State intern buton beeps
+static unsigned long s_lastButtonBeep   = 0;
 
-static void setLed(uint8_t pin, bool on) {
-  digitalWrite(pin, on ? HIGH : LOW);
+
+ 
+//  Inițializare
+ 
+
+void outputs_init() {
+    pinMode(LED_VERDE_PIN,    OUTPUT);
+    pinMode(LED_ROSU_PIN,     OUTPUT);
+    pinMode(LED_ALBASTRU_PIN, OUTPUT);
+    pinMode(BUZZER_PIN,       OUTPUT);
+
+    led_allOff();
+    digitalWrite(BUZZER_PIN, LOW);
+
+    Serial.println(F("Outputs: LED D6/D7/D4, Buzzer D5 initializate"));
 }
 
-void beep(int durata, int repetari, int frecventa) {
-  for (int i = 0; i < repetari; i++) {
-    tone(BUZZER_PIN, frecventa, durata);
-    unsigned long start = millis();
-    while (millis() - start < (unsigned long)durata + 40) {
-      // așteaptă scurt între beeps
-    }
-  }
-}
 
-// ============================================================================
-// Inițializare LED și buzzer
-// ============================================================================
+ 
+//  LED-uri
+ 
 
-void led_init() {
-  pinMode(LED_VERDE_PIN, OUTPUT);
-  pinMode(LED_ROSU_PIN, OUTPUT);
-  pinMode(LED_ALBASTRU_PIN, OUTPUT);
-  led_allOff();
-  Serial.println("Outputs: LED inițializate");
-}
-
-void buzzer_init() {
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-  Serial.println("Outputs: Buzzer inițializat");
-}
-
-// ============================================================================
-// Control LED
-// ============================================================================
-
-void led_greenOn() {
-  setLed(LED_VERDE_PIN, true);
-}
-
-void led_greenOff() {
-  setLed(LED_VERDE_PIN, false);
-}
-
-void led_redOn() {
-  setLed(LED_ROSU_PIN, true);
-}
-
-void led_redOff() {
-  setLed(LED_ROSU_PIN, false);
-}
-
-void led_blueOn() {
-  setLed(LED_ALBASTRU_PIN, true);
-}
-
-void led_blueOff() {
-  setLed(LED_ALBASTRU_PIN, false);
-}
+void led_greenOn()  { digitalWrite(LED_VERDE_PIN,    HIGH); }
+void led_greenOff() { digitalWrite(LED_VERDE_PIN,    LOW);  }
+void led_redOn()    { digitalWrite(LED_ROSU_PIN,     HIGH); }
+void led_redOff()   { digitalWrite(LED_ROSU_PIN,     LOW);  }
+void led_blueOn()   { digitalWrite(LED_ALBASTRU_PIN, HIGH); }
+void led_blueOff()  { digitalWrite(LED_ALBASTRU_PIN, LOW);  }
 
 void led_allOff() {
-  led_greenOff();
-  led_redOff();
-  led_blueOff();
+    led_greenOff();
+    led_redOff();
+    led_blueOff();
 }
 
-// ============================================================================
-// Control Buzzer
-// ============================================================================
+
+ 
+//  Buzzer — sunete blocante (durate scurte, acceptabil)
+ 
 
 void buzzer_confirmSound() {
-  beep(200, 1, 1000);
+    tone(BUZZER_PIN, BUZZER_CONFIRM_FREQ, BUZZER_CONFIRM_DUR);
+    delay(BUZZER_CONFIRM_DUR + 20);
 }
 
 void buzzer_errorSound() {
-  beep(1200, 1, 300);
+    tone(BUZZER_PIN, BUZZER_ERROR_FREQ, BUZZER_ERROR_DUR);
+    delay(BUZZER_ERROR_DUR + 20);
 }
 
+
+ 
+//  Buzzer — alarmă non-blocantă
+ 
+
 void buzzer_alarmStart() {
-  alarmActive = true;
-  timpUltimSunetAlarma = millis();
-  Serial.println("Outputs: Alarmă sonoră activată");
+    s_alarmActive   = true;
+    s_lastAlarmTick = millis();
+    tone(BUZZER_PIN, BUZZER_ALARM_FREQ, BUZZER_ALARM_DUR);
+    Serial.println(F("Outputs: alarma PORNITA"));
 }
 
 void buzzer_alarmStop() {
-  alarmActive = false;
-  noTone(BUZZER_PIN);
-  Serial.println("Outputs: Alarmă sonoră oprită");
+    s_alarmActive = false;
+    noTone(BUZZER_PIN);
+    Serial.println(F("Outputs: alarma OPRITA"));
 }
 
-void buzzer_alarmManage() {
-  if (alarmActive && millis() - timpUltimSunetAlarma >= intervalAlarma) {
-    timpUltimSunetAlarma = millis();
-    tone(BUZZER_PIN, 800, 250);
-  }
+void buzzer_alarmTick() {
+    if (!s_alarmActive) return;
+    if (millis() - s_lastAlarmTick >= BUZZER_ALARM_INTERVAL) {
+        s_lastAlarmTick = millis();
+        tone(BUZZER_PIN, BUZZER_ALARM_FREQ, BUZZER_ALARM_DUR);
+    }
 }
 
 bool buzzer_isAlarmActive() {
-  return alarmActive;
+    return s_alarmActive;
+}
+
+
+ 
+//  Buzzer — feedback buton (non-blocant, apelat din TEMP_OPEN)
+ 
+
+void buzzer_buttonTick(unsigned long now, unsigned long startMs) {
+    // Activ doar în fereastra TIMEOUT_BUTON_MS de la startMs
+    if (now - startMs >= TIMEOUT_BUTON_MS) return;
+
+    if (now - s_lastButtonBeep >= BUZZER_BUTON_INTERVAL) {
+        s_lastButtonBeep = now;
+        tone(BUZZER_PIN, BUZZER_BUTON_FREQ, BUZZER_BUTON_DUR);
+    }
 }

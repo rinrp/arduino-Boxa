@@ -2,29 +2,52 @@
 #define SENSORS_H
 
 #include <Arduino.h>
+#include "config.h"
 
-// ============================================================================
-// Definiții pini senzori și modem
-// ============================================================================
+// ============================================================
+//  sensors.h — Reed switch KY-021 și buton cu debouncing
+//
+//  Pini: REED_PIN=A0, BUTON_PIN=A1 (din config.h)
+// ============================================================
 
-#define MODEM_TX_PIN 2         // Modem TX
-#define MODEM_RX_PIN 3         // Modem RX
 
-#define SENZOR_MAGNETIC_PIN A0  // Pin pentru senzor magnetic KY-021
-#define BUTON_DESCHIDERE_PIN A1 // Pin pentru buton deschidere
+ 
+//  Inițializare
+ 
 
-// ============================================================================
-// Declarații funcții senzori
-// ============================================================================
+/** Inițializează pinii senzorului reed și butonului ca INPUT_PULLUP. */
+void sensors_init();
 
-void magneticSensor_init();
-void button_init();
 
-bool magneticSensor_isDoorClosed();
-bool magneticSensor_isDoorOpen();
+ 
+//  Reed switch (senzor magnetic ușă)
+ 
 
-bool button_isPressed();
+/**
+ * Returnează true dacă ușa este închisă.
+ * (câmp magnetic prezent → reed contact închis → LOW)
+ */
+bool door_isClosed();
 
-void magneticSensor_printState();
+/**
+ * Returnează true dacă ușa este deschisă.
+ * (câmp magnetic absent → reed contact deschis → HIGH)
+ */
+bool door_isOpen();
 
-#endif
+/** Afișează starea ușii în Serial Monitor. */
+void door_printState();
+
+
+ 
+//  Buton deschidere manuală
+ 
+
+/**
+ * Returnează true o singură dată la apăsarea butonului.
+ * Include debouncing de BUTON_DEBOUNCE_MS (din config.h).
+ * Apelați în fiecare iterație de loop().
+ */
+bool button_wasPressed();
+
+#endif // SENSORS_H

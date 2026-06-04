@@ -1,62 +1,65 @@
 #include "sensors.h"
 
-// ============================================================================
-// Variabile globale pentru buton
-// ============================================================================
+// ============================================================
+//  sensors.cpp — Implementare senzori
+// ============================================================
 
-unsigned long ultimulTimpApasareButon = 0;
-const unsigned long debounceDelay = 200;  // 200 ms debouncing
-static bool stareButonAnterioara = HIGH;
+ 
+//  State intern buton
+ 
+static bool     s_prevButtonState     = HIGH;   // HIGH = neapăsat (INPUT_PULLUP)
+static unsigned long s_lastPressMs    = 0;
 
-// ============================================================================
-// Inițializare senzori
-// ============================================================================
 
-void magneticSensor_init() {
-  pinMode(SENZOR_MAGNETIC_PIN, INPUT_PULLUP);
-  Serial.println("Senzor Magnetic: Inițializat");
+ 
+//  Inițializare
+ 
+
+void sensors_init() {
+    pinMode(REED_PIN,  INPUT_PULLUP);
+    pinMode(BUTON_PIN, INPUT_PULLUP);
+    Serial.println(F("Sensors: reed A0, buton A1 initializate"));
 }
 
-void button_init() {
-  pinMode(BUTON_DESCHIDERE_PIN, INPUT_PULLUP);
-  Serial.println("Senzor Buton: Inițializat");
+
+ 
+//  Reed switch
+ 
+
+bool door_isClosed() {
+    return digitalRead(REED_PIN) == DOOR_CLOSED_STATE;
 }
 
-// ============================================================================
-// Citire senzor magnetic
-// ============================================================================
-
-bool magneticSensor_isDoorClosed() {
-  return digitalRead(SENZOR_MAGNETIC_PIN) == LOW;
+bool door_isOpen() {
+    return digitalRead(REED_PIN) == DOOR_OPEN_STATE;
 }
 
-bool magneticSensor_isDoorOpen() {
-  return digitalRead(SENZOR_MAGNETIC_PIN) == HIGH;
+void door_printState() {
+    if (door_isClosed()) {
+        Serial.println(F("Reed: usa INCHISA"));
+    } else {
+        Serial.println(F("Reed: usa DESCHISA"));
+    }
 }
 
-void magneticSensor_printState() {
-  if (magneticSensor_isDoorClosed()) {
-    Serial.println("Senzor Magnetic: Ușă Închisă");
-  } else {
-    Serial.println("Senzor Magnetic: Ușă Deschisă");
-  }
-}
 
-// ============================================================================
-// Citire buton
-// ============================================================================
+ 
+//  Buton cu debouncing
+ 
 
-bool button_isPressed() {
-  bool stareButonCurenta = digitalRead(BUTON_DESCHIDERE_PIN);
+bool button_wasPressed() {
+    bool current = digitalRead(BUTON_PIN);
 
-  if (stareButonCurenta == LOW && stareButonAnterioara == HIGH &&
-      (millis() - ultimulTimpApasareButon) > debounceDelay) {
-    ultimulTimpApasareButon = millis();
-    stareButonAnterioara = stareButonCurenta;
-    Serial.println("Senzor Buton: Apăsat");
-    return true;
-  }
+    // Front descendent (HIGH→LOW) cu debouncing
+    if (current == LOW && s_prevButtonState == HIGH) {
+        if (millis() - s_lastPressMs > BUTON_DEBOUNCE_MS) {
+            s_lastPressMs    = millis();
+            s_prevButtonState = current;
+            Serial.println(F("Buton: apasat"));
+            return true;
+        }
+    }
 
-  stareButonAnterioara = stareButonCurenta;
-  return false;
+    s_prevButtonState = current;
+    return false;
 }

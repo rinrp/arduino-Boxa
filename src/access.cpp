@@ -2,9 +2,9 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-// ============================================================================
+ 
 // Definiții pini pentru modul RFID
-// ============================================================================
+ 
 
 #define RFID_SDA_PIN 10
 #define RFID_RST_PIN 9
@@ -17,9 +17,9 @@ MFRC522 mfrc522(RFID_SDA_PIN, RFID_RST_PIN);
 // UID autorizat
 byte uidValid[4] = {0xCA, 0xFD, 0xA1, 0x80};
 
-// ============================================================================
+ 
 // Inițializare modul RFID
-// ============================================================================
+ 
 
 void access_init() {
   SPI.begin();
@@ -27,9 +27,9 @@ void access_init() {
   Serial.println("RFID: MFRC522 inițializat");
 }
 
-// ============================================================================
+ 
 // Citire și validare UID
-// ============================================================================
+ 
 
 bool access_isCardDetected() {
   return mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial();
