@@ -3,10 +3,13 @@
 #include "sensors.h"
 #include "outputs.h"
 #include "access.h"
+#include "cardmanager.h"   // ← nou: gestiune carduri EEPROM
+#include "nbiot.h"         // ← nou: NB-IoT + MQTT Live Objects
 
 
+// ============================================================
 //  Definiție stări
-  
+// ============================================================
 
 enum State {
     IDLE,
@@ -17,17 +20,18 @@ enum State {
 };
 
 
-  
+// ============================================================
 //  Variabile globale state machine
-  
+// ============================================================
 
 static State         g_state             = IDLE;
-static unsigned long g_stateEntryMs      = 0;   // millis() la intrarea în stare
+static unsigned long g_stateEntryMs      = 0;
 
 // ACCESS_GRANTED
-static bool          g_yalaActive        = false;  // true după delay yală
+static bool          g_yalaActive        = false;
 static unsigned long g_yalaActivatedMs   = 0;
 static bool          g_doorOpenedInCycle = false;
+static char          g_lastUID[15]       = "";  // UID-ul cardului curent
 
 // TEMP_OPEN
 static bool          g_doorOpenedByBtn   = false;
@@ -40,10 +44,13 @@ static unsigned long g_stabilizeStartMs  = 0;
 static unsigned long g_lastLogMs         = 0;
 static int           g_prevReedRaw       = -1;
 
+// Deschidere remotă comandată din cloud
+static bool          g_remoteOpenPending = false;
 
-  
+
+// ============================================================
 //  Helper: tranziție cu log
-  
+// ============================================================
 
 static const __FlashStringHelper* stateName(State s) {
     switch (s) {
@@ -53,6 +60,17 @@ static const __FlashStringHelper* stateName(State s) {
         case TEMP_OPEN:      return F("TEMP_OPEN");
         case ALARM:          return F("ALARM");
         default:             return F("?");
+    }
+}
+
+static const char* stateNameStr(State s) {
+    switch (s) {
+        case IDLE:           return "IDLE";
+        case ACCESS_GRANTED: return "ACCESS_GRANTED";
+        case ACCESS_DENIED:  return "ACCESS_DENIED";
+        case TEMP_OPEN:      return "TEMP_OPEN";
+        case ALARM:          return "ALARM";
+        default:             return "UNKNOWN";
     }
 }
 
@@ -67,17 +85,94 @@ static void enterState(State next) {
 }
 
 
-  
+// ============================================================
 //  Helper: terminare ciclu cu stabilizare
-//  Apelat când ușa s-a deschis ȘI s-a închis corect.
-  
+// ============================================================
 
 static void beginStabilization() {
     led_allOff();
-    g_stabilizing       = true;
-    g_stabilizeStartMs  = millis();
+    g_stabilizing      = true;
+    g_stabilizeStartMs = millis();
     enterState(IDLE);
     Serial.println(F("Stabilizare activa..."));
+}
+
+
+// ============================================================
+//  Callback comenzi NB-IoT
+//  Apelat din nbiot_checkCommands() când sosește o comandă.
+// ============================================================
+
+static void onNbiotCommand(const NbiotCommand& cmd) {
+    switch (cmd.type) {
+
+        // ----------------------------------------------------------
+        // CMD_OPEN: deschide yala de la distanță
+        // Echivalent cu apăsarea butonului fizic, dar numai din IDLE.
+        // ----------------------------------------------------------
+        case CMD_OPEN:
+            Serial.println(F("[CMD] Remote: DESCHIDE USA"));
+            nbiot_publish(EVT_REMOTE_OPEN, "", stateNameStr(g_state));
+
+            if (g_state == IDLE) {
+                g_remoteOpenPending = true;  // Procesat în loop()
+            } else {
+                Serial.println(F("[CMD] Ignorat: sistemul nu e in IDLE"));
+            }
+            break;
+
+        // ----------------------------------------------------------
+        // CMD_CARD_ADD: adaugă un card nou în EEPROM
+        // ----------------------------------------------------------
+        case CMD_CARD_ADD: {
+            Serial.print(F("[CMD] Remote: ADAUGA CARD "));
+            Serial.println(cmd.uid);
+
+            byte uid[4];
+            if (cardmanager_parseUID(cmd.uid, uid)) {
+                bool ok = cardmanager_add(uid);
+                // Publică confirmare
+                nbiot_publish(ok ? EVT_CARD_ADDED : EVT_SYSTEM_STATUS,
+                              cmd.uid,
+                              ok ? "added" : "add_failed");
+            } else {
+                Serial.println(F("[CMD] card_add: UID invalid"));
+                nbiot_publish(EVT_SYSTEM_STATUS, cmd.uid, "uid_parse_error");
+            }
+            break;
+        }
+
+        // ----------------------------------------------------------
+        // CMD_CARD_REMOVE: elimină un card din EEPROM
+        // ----------------------------------------------------------
+        case CMD_CARD_REMOVE: {
+            Serial.print(F("[CMD] Remote: ELIMINA CARD "));
+            Serial.println(cmd.uid);
+
+            byte uid[4];
+            if (cardmanager_parseUID(cmd.uid, uid)) {
+                bool ok = cardmanager_remove(uid);
+                nbiot_publish(ok ? EVT_CARD_REMOVED : EVT_SYSTEM_STATUS,
+                              cmd.uid,
+                              ok ? "removed" : "not_found");
+            } else {
+                Serial.println(F("[CMD] card_remove: UID invalid"));
+                nbiot_publish(EVT_SYSTEM_STATUS, cmd.uid, "uid_parse_error");
+            }
+            break;
+        }
+
+        // ----------------------------------------------------------
+        // CMD_STATUS: publică starea curentă
+        // ----------------------------------------------------------
+        case CMD_STATUS:
+            Serial.println(F("[CMD] Remote: STATUS REQUEST"));
+            nbiot_publish(EVT_SYSTEM_STATUS, "", stateNameStr(g_state));
+            break;
+
+        default:
+            break;
+    }
 }
 
 
@@ -90,18 +185,31 @@ void setup() {
     while (!Serial);
 
     Serial.println(F("===================================="));
-    Serial.println(F("  Sistem control acces RFID v2.0   "));
+    Serial.println(F("  Sistem control acces RFID v3.0   "));
+    Serial.println(F("  + NB-IoT / Orange Live Objects   "));
     Serial.println(F("===================================="));
 
+    // Inițializări hardware
     access_init();
     outputs_init();
     sensors_init();
+
+    // Gestiune carduri din EEPROM
+    cardmanager_init();
+
+    // NB-IoT — înregistrăm callback-ul ÎNAINTE de init
+    nbiot_setCommandCallback(onNbiotCommand);
+    if (!nbiot_init()) {
+        Serial.println(F("AVERTIZARE: NB-IoT offline. Sistem functional local."));
+        // Sistemul continuă să funcționeze local chiar fără conexiune cloud
+    }
 
     led_allOff();
 
     Serial.println(F("Initializare completa"));
     Serial.println();
 }
+
 
 // ============================================================
 //  loop()
@@ -111,21 +219,43 @@ void loop() {
     unsigned long now = millis();
 
     // ----------------------------------------------------------
-    // 1. Detectare schimbare reed (debug serial)
+    // 1. NB-IoT — inițializare în background + comenzi
+    //    initTick() finalizează conectarea la rețea/MQTT fără
+    //    a bloca senzorii sau RFID-ul
+    // ----------------------------------------------------------
+    nbiot_initTick();
+    nbiot_checkCommands();
+
+    // ----------------------------------------------------------
+    // 2. Heartbeat periodic către Live Objects
+    // ----------------------------------------------------------
+    nbiot_heartbeatTick(stateNameStr(g_state));
+
+    // ----------------------------------------------------------
+    // 3. Detectare schimbare reed (debug serial)
     // ----------------------------------------------------------
     int reedRaw = digitalRead(REED_PIN);
     if (reedRaw != g_prevReedRaw) {
         g_prevReedRaw = reedRaw;
+        bool isOpen = door_isOpen();
+
         Serial.print(F("STATUS="));
         Serial.print(reedRaw);
-        Serial.print(F("  UȘA="));
-        Serial.print(door_isOpen() ? F("DESCHISĂ") : F("INCHISĂ"));
+        Serial.print(F("  USA="));
+        Serial.print(isOpen ? F("DESCHISA") : F("INCHISA"));
         Serial.print(F("  state="));
         Serial.println(stateName(g_state));
+
+        // Publică evenimentul de schimbare stare ușă
+        nbiot_publish(
+            isOpen ? EVT_DOOR_OPEN : EVT_DOOR_CLOSED,
+            "",
+            stateNameStr(g_state)
+        );
     }
 
     // ----------------------------------------------------------
-    // 2. Log periodic stare ușă
+    // 4. Log periodic stare ușă
     // ----------------------------------------------------------
     if (now - g_lastLogMs >= LOG_INTERVAL_MS) {
         g_lastLogMs = now;
@@ -133,8 +263,7 @@ void loop() {
     }
 
     // ----------------------------------------------------------
-    // 3. Perioadă de stabilizare post-închidere
-    //    Ignoră orice eveniment de alarmă în această fereastră.
+    // 5. Perioadă de stabilizare post-închidere
     // ----------------------------------------------------------
     if (g_stabilizing) {
         if (now - g_stabilizeStartMs >= DURATA_STABILIZARE_MS) {
@@ -142,15 +271,14 @@ void loop() {
             led_allOff();
             Serial.println(F("Sistem ARMAT"));
         } else if (now - g_stabilizeStartMs > STABILIZARE_MAX_MS) {
-            // Watchdog de siguranță
             g_stabilizing = false;
             Serial.println(F("AVERTIZARE: stabilizare reset fortat"));
         }
-        return;  // <-- NU procesăm nicio stare în timpul stabilizării
+        return;
     }
 
     // ----------------------------------------------------------
-    // 4. State machine
+    // 6. State machine
     // ----------------------------------------------------------
 
     switch (g_state) {
@@ -158,30 +286,46 @@ void loop() {
         // ======================================================
         case IDLE:
         // ======================================================
-        //  LED-uri: toate stinse
-        //  Monitorizează: card RFID, buton, ușă forțată
-        // ======================================================
 
             led_allOff();
+
+            // --- Deschidere remotă din cloud ---
+            if (g_remoteOpenPending) {
+                g_remoteOpenPending = false;
+                Serial.println(F("Remote: deschidere autorizata din cloud"));
+                led_blueOn();
+                g_doorOpenedByBtn = false;
+                enterState(TEMP_OPEN);
+                break;
+            }
 
             // --- Card RFID ---
             if (access_isCardDetected()) {
                 access_printUID();
+                access_uidToString(g_lastUID, sizeof(g_lastUID));
 
-                if (access_isUIDValid()) {
-                    // Card valid: LED verde + bip confirmare → ACCESS_GRANTED
+                // Verificare cu cardmanager (EEPROM) în loc de UID hardcodat
+                if (cardmanager_isValid(access_getUID())) {
                     Serial.println(F("Card: VALID - acces permis"));
                     led_greenOn();
                     buzzer_confirmSound();
+
+                    nbiot_publish(EVT_ACCESS_GRANTED,
+                                  g_lastUID,
+                                  "ACCESS_GRANTED");
 
                     g_yalaActive        = false;
                     g_doorOpenedInCycle = false;
                     enterState(ACCESS_GRANTED);
                 } else {
-                    // Card invalid: LED roșu + bip eroare → ACCESS_DENIED
                     Serial.println(F("Card: INVALID - acces refuzat"));
                     led_redOn();
                     buzzer_errorSound();
+
+                    nbiot_publish(EVT_ACCESS_DENIED,
+                                  g_lastUID,
+                                  "ACCESS_DENIED");
+
                     enterState(ACCESS_DENIED);
                 }
 
@@ -196,12 +340,14 @@ void loop() {
                 enterState(TEMP_OPEN);
             }
 
-            // --- Ușă forțată (alarmă) ---
-            // Verificăm DUPĂ stabilizare (return mai sus garantează asta)
+            // --- Ușă forțată ---
             if (door_isOpen()) {
-                Serial.println(F("ALARMA: Ușa forțată!"));
+                Serial.println(F("ALARMA: Usa fortata!"));
                 led_redOn();
                 buzzer_alarmStart();
+
+                nbiot_publish(EVT_ALARM_START, "", "ALARM");
+
                 enterState(ALARM);
             }
 
@@ -211,32 +357,23 @@ void loop() {
         // ======================================================
         case ACCESS_GRANTED:
         // ======================================================
-        //  Faza 1 (0 → DELAY_YALA_MS):     LED verde aprins
-        //  Faza 2 (DELAY_YALA_MS → +):     LED verde + albastru (yală activă)
-        //    → dacă ușa se deschide și se închide: stabilizare → IDLE
-        //    → dacă timeout   TIMEOUT_ASTEPTARE_USA_MS fără deschidere: IDLE
-        //    → dacă ușa e forțată: ALARM
-        // ======================================================
 
             led_greenOn();
 
-            // Faza 1→2: activare yală după delay
             if (!g_yalaActive &&
                 now - g_stateEntryMs >= DELAY_YALA_MS) {
                 led_blueOn();
-                g_yalaActive      = true;
-                g_yalaActivatedMs = now;
+                g_yalaActive        = true;
+                g_yalaActivatedMs   = now;
                 g_doorOpenedInCycle = false;
                 Serial.println(F("Yala activa (LED albastru)"));
             }
 
             if (g_yalaActive) {
-                // Urmărim dacă ușa s-a deschis
                 if (door_isOpen()) {
                     g_doorOpenedInCycle = true;
                 }
 
-                // Ușă deschisă → închisă: acces completat
                 if (g_doorOpenedInCycle && door_isClosed()) {
                     Serial.println(F("Usa inchisa dupa acces valid -> stabilizare"));
                     beginStabilization();
@@ -245,7 +382,6 @@ void loop() {
                     break;
                 }
 
-                // Timeout: ușa nu s-a deschis deloc
                 if (!g_doorOpenedInCycle &&
                     now - g_yalaActivatedMs >= TIMEOUT_ASTEPTARE_USA_MS) {
                     Serial.println(F("Timeout: usa nu s-a deschis"));
@@ -254,11 +390,6 @@ void loop() {
                     enterState(IDLE);
                     break;
                 }
-
-                // Ușă forțată (yală era activă dar ușa n-a trebuit să fie deschisă)
-                // Acoperit implicit: dacă doorOpenedInCycle e true și ușa rămâne
-                // deschisă mai mult decât normal, nu declanșăm alarmă — e o
-                // deschidere autorizată în curs. Alarma se declanșează în IDLE.
             }
 
             break;
@@ -267,23 +398,21 @@ void loop() {
         // ======================================================
         case ACCESS_DENIED:
         // ======================================================
-        //  LED roșu aprins DURATA_REFUZ_CARD_MS, apoi IDLE.
-        //  Dacă ușa se deschide în acest interval: ALARM.
-        // ======================================================
 
             led_redOn();
 
-            // Timeout → re-armare
             if (now - g_stateEntryMs >= DURATA_REFUZ_CARD_MS) {
                 Serial.println(F("Card invalid: timeout -> IDLE"));
                 led_redOff();
                 enterState(IDLE);
             }
 
-            // Ușă forțată în timp ce cardul era invalid
             if (door_isOpen()) {
-                Serial.println(F("ALARMA: Ușa fortata in ACCESS_DENIED!"));
+                Serial.println(F("ALARMA: Usa fortata in ACCESS_DENIED!"));
                 buzzer_alarmStart();
+
+                nbiot_publish(EVT_ALARM_START, g_lastUID, "ALARM");
+
                 enterState(ALARM);
             }
 
@@ -293,21 +422,14 @@ void loop() {
         // ======================================================
         case TEMP_OPEN:
         // ======================================================
-        //  LED albastru + beep periodic TIMEOUT_BUTON_MS.
-        //  Dacă ușa se deschide și se închide: stabilizare → IDLE.
-        //  Dacă timeout fără deschidere: IDLE (re-armare automată).
-        //  Nu se declanșează alarmă în TEMP_OPEN (deschidere autorizată).
-        // ======================================================
 
             led_blueOn();
             buzzer_buttonTick(now, g_stateEntryMs);
 
-            // Urmărim deschiderea ușii
             if (door_isOpen()) {
                 g_doorOpenedByBtn = true;
             }
 
-            // Ușă deschisă → închisă
             if (g_doorOpenedByBtn && door_isClosed()) {
                 Serial.println(F("Usa inchisa dupa buton"));
                 noTone(BUZZER_PIN);
@@ -316,9 +438,8 @@ void loop() {
                 break;
             }
 
-            // Timeout fără utilizare
             if (now - g_stateEntryMs >= TIMEOUT_BUTON_MS) {
-                Serial.println(F("Buton timeout: usa neutilizată"));
+                Serial.println(F("Buton timeout: usa neutilizata"));
                 noTone(BUZZER_PIN);
                 led_blueOff();
                 g_doorOpenedByBtn = false;
@@ -331,10 +452,6 @@ void loop() {
         // ======================================================
         case ALARM:
         // ======================================================
-        //  LED roșu + buzzer intermitent.
-        //  Oprire DOAR când ușa se închide.
-        //  (Varianta extinsă: adăugați un PIN pentru cheie de dezarmare.)
-        // ======================================================
 
             led_redOn();
             buzzer_alarmTick();
@@ -343,6 +460,9 @@ void loop() {
                 Serial.println(F("Usa inchisa -> alarma oprita"));
                 buzzer_alarmStop();
                 led_redOff();
+
+                nbiot_publish(EVT_ALARM_STOP, "", "IDLE");
+
                 enterState(IDLE);
             }
 
