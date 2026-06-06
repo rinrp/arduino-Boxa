@@ -5,6 +5,7 @@
 #include "access.h"
 #include "cardmanager.h"   // ← nou: gestiune carduri EEPROM
 #include "nbiot.h"         // ← nou: NB-IoT + MQTT Live Objects
+#include "diagnostics.h"
 
 
 // ============================================================
@@ -203,6 +204,9 @@ void setup() {
         Serial.println(F("AVERTIZARE: NB-IoT offline. Sistem functional local."));
         // Sistemul continuă să funcționeze local chiar fără conexiune cloud
     }
+
+    // Test hardware pinii și funcțiile principale
+    diagnostics_runHardwareCheck();
 
     led_allOff();
 
