@@ -1,4 +1,5 @@
 #include "cardmanager.h"
+#include "config.h"
 #include <EEPROM.h>
 
 // ============================================================
@@ -42,18 +43,25 @@ static bool uidEquals(const byte* a, const byte* b) {
 //  Inițializare
 // ============================================================
 
+static bool isEEPROMBlank() {
+    for (byte b = 0; b < CARD_UID_LENGTH; b++) {
+        if (EEPROM.read(EEPROM_DATA_ADDR + b) != 0xFF) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void cardmanager_init() {
     s_count = EEPROM.read(EEPROM_COUNT_ADDR);
 
     // Validare: dacă EEPROM-ul e neiniţializat (0xFF) sau corupt
-    if (s_count > CARD_MAX_COUNT) {
-        s_count = 0;
-        // Adauga cardul implicit CA:FD:A1:80 la primul boot
-        const byte defaultUID[CARD_UID_LENGTH] = {0xCA, 0xFD, 0xA1, 0x80};
-        for (byte b = 0; b < CARD_UID_LENGTH; b++) {
-            s_cards[0][b] = defaultUID[b];
-        }
+    if (s_count == 0xFF || s_count > CARD_MAX_COUNT ||
+        (s_count == 0 && isEEPROMBlank())) {
         s_count = 1;
+        for (byte b = 0; b < CARD_UID_LENGTH; b++) {
+            s_cards[0][b] = UID_VALID[b];
+        }
         saveToEEPROM();
         Serial.println(F("CardManager: primul boot - card CA:FD:A1:80 adaugat"));
         return;
