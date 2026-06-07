@@ -5,7 +5,6 @@
 #include "config.h"
 
 //  Inițializare
-
 /** Inițializează pinii senzorului reed și butonului ca INPUT_PULLUP. */
 void sensors_init();
 
@@ -24,9 +23,7 @@ bool door_isOpen();
 
 /** Afișează starea ușii în Serial Monitor. */
 void door_printState();
-
 //  Buton deschidere manuală
-  
 /**
  * Returnează true o singură dată la apăsarea butonului.
  * Include debouncing de BUTON_DEBOUNCE_MS (din config.h).

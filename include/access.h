@@ -11,24 +11,17 @@
 //    RFID_SDA_PIN = D10  (SS/CS)
 //    RFID_RST_PIN = D9
 //    MOSI = D11, MISO = D12, SCK = D13  (SPI hardware, auto)
-//
 //  UID autorizat: configurat în config.h
 // ============================================================
 
 
-  
 //  Inițializare
-//  Apelați după SPI.begin() — sau lăsați access_init() să
-//  apeleze SPI.begin() intern (recomandat).
-  
-
+//  Apelați după SPI.begin() — sau lăsați access_init() să apeleze SPI.begin() intern (recomandat).
 void access_init();
 
 
   
 //  Citire card
-  
-
 /**
  * Verifică dacă un card nou este prezent și citește UID-ul.
  * Returnează true dacă un card a fost detectat și citit cu succes.

@@ -348,11 +348,9 @@ void loop() {
             if (door_isOpen()) {
                 Serial.println(F("ALARMA: Usa fortata!"));
                 led_redOn();
-                buzzer_alarmStart();
-
-                nbiot_publish(EVT_ALARM_START, "", "ALARM");
-
                 enterState(ALARM);
+                nbiot_publish(EVT_ALARM_START, "", "ALARM");
+                buzzer_alarmStart();
             }
 
             break;

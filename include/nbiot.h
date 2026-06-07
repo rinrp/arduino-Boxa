@@ -2,21 +2,6 @@
 #define NBIOT_H
 
 #include <Arduino.h>
-
-// ============================================================
-//  nbiot.h — Modul NB-IoT Quectel BC92 + MQTT Live Objects
-//
-//  Hardware:
-//    BC92 TX → Arduino RX (D3 = MODEM_RX_PIN)
-//    BC92 RX → Arduino TX (D2 = MODEM_TX_PIN)
-//    Comunicație via SoftwareSerial
-//
-//  Protocol: MQTT over NB-IoT
-//  Platformă: Orange Live Objects
-//
-// ============================================================
-
-// ============================================================
 //  !! PLACEHOLDER-E — înlocuiește cu valorile tale reale !!
 //
 //  LO_API_KEY    → cheia API din Live Objects
@@ -34,9 +19,9 @@
 //                  Standard Live Objects: "dev/cmd"
 //
 //  LO_MQTT_HOST  → brokerul MQTT Live Objects
-//                  Standard: "liveobjects.orange-business.com"
+//                  Standard: "mqtt.liveobjects.orange-business.com"
 //
-//  LO_MQTT_PORT  → portul MQTT (1883 fără TLS)
+//  LO_MQTT_PORT  → portul MQTT (8883 fără TLS)
 // ============================================================
 
 //  !! CREDENTIALE LIVE OBJECTS — nu le distribui public !!
@@ -48,30 +33,21 @@
 //  LO_TOPIC_PUB   → topic publish date senzori
 //  LO_TOPIC_SUB   → topic subscribe comenzi
 //  LO_MQTT_HOST   → broker MQTT Live Objects
-//  LO_MQTT_PORT   → port MQTT (1883 fara TLS)
+//  LO_MQTT_PORT   → port MQTT (8883 fara TLS)
 //  LO_MQTT_USER   → username MQTT Live Objects (fix, nu modifica)
 
-#define LO_API_KEY      "8d0264da509344169bb3fa89b071df72"
+#define LO_API_KEY      "API_KEY_TAU_NOU"
 #define LO_DEVICE_ID    "urn:lo:nsid:mqtt:RFID"
-#define LO_MQTT_CLIENT  "ArduinoRFID"
 #define LO_STREAM_ID    "urn:lo:nsid:mqtt:RFID"
+
 #define LO_TOPIC_PUB    "dev/data"
 #define LO_TOPIC_SUB    "dev/cmd"
-#define LO_MQTT_HOST    "liveobjects.orange-business.com"
-#define LO_MQTT_PORT    1883
+#define LO_TOPIC_CMD_RES "dev/cmd/res"
 
-// Username MQTT Live Objects — nu modifica
+#define LO_MQTT_HOST    "mqtt.liveobjects.orange-business.com"
+#define LO_MQTT_PORT    8883
 #define LO_MQTT_USER    "json+device"
-
-// ============================================================
-//  Fallback SMS
-//  Trimis pentru evenimente critice când MQTT e offline.
-//
-//  LO_SMS_ADMIN_NR → numărul tău de telefon (format internațional)
-//                    ex: "+40712345678"
-//                    Înlocuiește cu numărul tău real!
-// ============================================================
-#define LO_SMS_ADMIN_NR  "+40750288935"
+#define LO_SMS_ADMIN_NR  "3523"
 
 // ============================================================
 //  Tipuri de evenimente publicate

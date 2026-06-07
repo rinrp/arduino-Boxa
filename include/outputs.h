@@ -6,12 +6,10 @@
 
 
 //  Inițializare
-
 /** Inițializează toți pinii de ieșire și stinge LED-urile. */
 void outputs_init();
 
 //  LED-uri
-
 void led_greenOn();
 void led_greenOff();
 
