@@ -8,6 +8,9 @@
 
 #define MODEM_BAUD 9600
 
+#define MQTT_RECONNECT_MAX_ATTEMPTS 5
+#define MQTT_RECONNECT_COOLDOWN_MS  5000UL
+
 // SoftwareSerial(rx, tx)
 // BC92 TX -> Arduino RX = MODEM_RX_PIN
 // BC92 RX -> Arduino TX = MODEM_TX_PIN
@@ -20,16 +23,25 @@ static SoftwareSerial s_modem(MODEM_RX_PIN, MODEM_TX_PIN);
 
 enum InitState {
     INIT_IDLE,
+
     INIT_AT_TEST,
     INIT_ECHO_OFF,
     INIT_APN,
     INIT_CEREG,
     INIT_CSQ,
+
     INIT_MQTT_VERSION,
     INIT_MQTT_SSL,
     INIT_MQTOPEN,
     INIT_MQTCONN,
     INIT_MQTSUB,
+
+    // Deconectare completă MQTT înainte de reconnect
+    INIT_MQTT_UNSUB,
+    INIT_MQTT_DISC,
+    INIT_MQTT_CLOSE,
+    INIT_RECONNECT_COOLDOWN,
+
     INIT_DONE,
     INIT_FAILED
 };
@@ -42,6 +54,7 @@ static unsigned long s_initStepTimeout = 0;
 static byte s_atRetries = 0;
 static byte s_stepRetries = 0;
 static byte s_ceregRetries = 0;
+static byte s_mqttReconnectAttempts = 0;
 
 static bool s_connected = false;
 static bool s_network_ready = false;
@@ -283,6 +296,73 @@ static void sendQmtSub() {
     delay(100);
 }
 
+static void sendQmtUnsub() {
+    clearAtBuffer();
+
+    s_modem.print(F("AT+QMTUNS=0,2,\""));
+    s_modem.print(LO_TOPIC_SUB);
+    s_modem.println(F("\""));
+
+    Serial.print(F("[AT>>] AT+QMTUNS=0,2,\""));
+    Serial.print(LO_TOPIC_SUB);
+    Serial.println(F("\""));
+
+    delay(100);
+}
+
+static void sendQmtDisc() {
+    clearAtBuffer();
+
+    s_modem.println(F("AT+QMTDISC=0"));
+
+    Serial.println(F("[AT>>] AT+QMTDISC=0"));
+
+    delay(100);
+}
+
+static void sendQmtClose() {
+    clearAtBuffer();
+
+    s_modem.println(F("AT+QMTCLOSE=0"));
+
+    Serial.println(F("[AT>>] AT+QMTCLOSE=0"));
+
+    delay(100);
+}
+
+
+// ============================================================
+//  Reconnect complet MQTT
+// ============================================================
+
+static void beginFullMqttReconnect(const __FlashStringHelper* reason) {
+    Serial.print(F("[NB-IoT] Reconnect MQTT complet cerut: "));
+    Serial.println(reason);
+
+    s_connected = false;
+
+    if (s_mqttReconnectAttempts >= MQTT_RECONNECT_MAX_ATTEMPTS) {
+        Serial.println(F("[NB-IoT] EROARE: reconnect MQTT esuat dupa 5 incercari."));
+        Serial.println(F("[NB-IoT] Sistemul ramane functional LOCAL."));
+        s_initState = INIT_FAILED;
+        return;
+    }
+
+    s_mqttReconnectAttempts++;
+
+    Serial.print(F("[NB-IoT] Reconnect attempt "));
+    Serial.print(s_mqttReconnectAttempts);
+    Serial.print(F("/"));
+    Serial.println(MQTT_RECONNECT_MAX_ATTEMPTS);
+
+    s_stepRetries = 0;
+    s_initStepMs = millis();
+    s_initStepTimeout = 3000;
+
+    s_initState = INIT_MQTT_UNSUB;
+    sendQmtUnsub();
+}
+
 
 // ============================================================
 //  SMS fallback către Live Objects
@@ -376,6 +456,7 @@ bool nbiot_init() {
     s_atRetries = 0;
     s_stepRetries = 0;
     s_ceregRetries = 0;
+    s_mqttReconnectAttempts = 0;
 
     s_initState = INIT_AT_TEST;
     s_initStepMs = millis();
@@ -581,7 +662,7 @@ void nbiot_initTick() {
                 if (s_stepRetries >= 3) {
                     Serial.println(F("[NB-IoT] EROARE: setare MQTT version esuata"));
                     printRawIfAny();
-                    s_initState = INIT_FAILED;
+                    beginFullMqttReconnect(F("QMTCFG version failed"));
                 } else {
                     s_initStepMs = now;
                     atWrite(F("AT+QMTCFG=\"version\",0,1"));
@@ -607,7 +688,7 @@ void nbiot_initTick() {
                 if (s_stepRetries >= 3) {
                     Serial.println(F("[NB-IoT] EROARE: activare SSL/TLS MQTT esuata"));
                     printRawIfAny();
-                    s_initState = INIT_FAILED;
+                    beginFullMqttReconnect(F("QMTCFG ssl failed"));
                 } else {
                     s_initStepMs = now;
                     atWrite(F("AT+QMTCFG=\"ssl\",0,1,1,0"));
@@ -627,25 +708,30 @@ void nbiot_initTick() {
                 s_stepRetries = 0;
 
                 sendQmtConn();
-            } else if (atHasError()) {
+            }
+
+            // A primit +QMTOPEN dar cu alt cod decât 0
+            else if (strstr(s_atBuf, "+QMTOPEN: 0,")) {
                 Serial.println(F("[NB-IoT] EROARE QMTOPEN:"));
                 Serial.println(s_atBuf);
-                s_initState = INIT_FAILED;
-            } else if (now - s_initStepMs > s_initStepTimeout) {
-                s_stepRetries++;
 
-                if (s_stepRetries >= 3) {
-                    Serial.println(F("[NB-IoT] EROARE: QMTOPEN timeout dupa 3 incercari"));
-                    printRawIfAny();
-                    s_initState = INIT_FAILED;
-                } else {
-                    Serial.print(F("[NB-IoT] Reincercare QMTOPEN "));
-                    Serial.print(s_stepRetries);
-                    Serial.println(F("/3..."));
+                beginFullMqttReconnect(F("QMTOPEN result error"));
+            }
 
-                    s_initStepMs = now;
-                    sendQmtOpen();
-                }
+            // ERROR / CME ERROR
+            else if (atHasError()) {
+                Serial.println(F("[NB-IoT] EROARE QMTOPEN:"));
+                Serial.println(s_atBuf);
+
+                beginFullMqttReconnect(F("QMTOPEN ERROR"));
+            }
+
+            // Timeout
+            else if (now - s_initStepMs > s_initStepTimeout) {
+                Serial.println(F("[NB-IoT] EROARE: QMTOPEN timeout."));
+                printRawIfAny();
+
+                beginFullMqttReconnect(F("QMTOPEN timeout"));
             }
             break;
 
@@ -663,21 +749,25 @@ void nbiot_initTick() {
                 sendQmtSub();
             } else if (atReadCheck("+QMTCONN: 0,0,4")) {
                 Serial.println(F("[NB-IoT] EROARE: username/parola gresite."));
-                s_initState = INIT_FAILED;
+                beginFullMqttReconnect(F("QMTCONN bad credentials"));
             } else if (atReadCheck("+QMTCONN: 0,0,5")) {
                 Serial.println(F("[NB-IoT] EROARE: not authorized. Verifica API key / DEVICE_ACCESS."));
-                s_initState = INIT_FAILED;
+                beginFullMqttReconnect(F("QMTCONN not authorized"));
+            } else if (strstr(s_atBuf, "+QMTCONN: 0,")) {
+                Serial.println(F("[NB-IoT] EROARE QMTCONN:"));
+                Serial.println(s_atBuf);
+                beginFullMqttReconnect(F("QMTCONN result error"));
             } else if (atHasError()) {
                 Serial.println(F("[NB-IoT] EROARE QMTCONN:"));
                 Serial.println(s_atBuf);
-                s_initState = INIT_FAILED;
+                beginFullMqttReconnect(F("QMTCONN ERROR"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
 
                 if (s_stepRetries >= 3) {
                     Serial.println(F("[NB-IoT] EROARE: autentificare MQTT esuata dupa 3 incercari"));
                     printRawIfAny();
-                    s_initState = INIT_FAILED;
+                    beginFullMqttReconnect(F("QMTCONN timeout"));
                 } else {
                     Serial.print(F("[NB-IoT] Reincercare MQTT auth "));
                     Serial.print(s_stepRetries);
@@ -694,6 +784,7 @@ void nbiot_initTick() {
             if (atReadCheck("+QMTSUB:")) {
                 s_connected = true;
                 s_initState = INIT_DONE;
+                s_mqttReconnectAttempts = 0;
 
                 Serial.println(F("[NB-IoT] === ONLINE pe Live Objects MQTT! ==="));
 
@@ -707,14 +798,15 @@ void nbiot_initTick() {
             } else if (atHasError()) {
                 Serial.println(F("[NB-IoT] EROARE QMTSUB:"));
                 Serial.println(s_atBuf);
-                s_initState = INIT_FAILED;
+
+                beginFullMqttReconnect(F("QMTSUB ERROR"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
 
                 if (s_stepRetries >= 3) {
                     Serial.println(F("[NB-IoT] EROARE: abonare MQTT esuata dupa 3 incercari"));
                     printRawIfAny();
-                    s_initState = INIT_FAILED;
+                    beginFullMqttReconnect(F("QMTSUB timeout"));
                 } else {
                     Serial.print(F("[NB-IoT] Reincercare MQTT subscribe "));
                     Serial.print(s_stepRetries);
@@ -723,6 +815,87 @@ void nbiot_initTick() {
                     s_initStepMs = now;
                     sendQmtSub();
                 }
+            }
+            break;
+
+
+        // ====================================================
+        //  Deconectare completă MQTT înainte de reconnect
+        // ====================================================
+
+        case INIT_MQTT_UNSUB:
+            if (atReadCheck("+QMTUNS:") ||
+                atReadCheck("OK") ||
+                atHasError() ||
+                now - s_initStepMs > s_initStepTimeout)
+            {
+                Serial.println(F("[NB-IoT] MQTT unsubscribe terminat/ignorat."));
+                Serial.println(F("[NB-IoT] Deconectez sesiunea MQTT..."));
+
+                s_initState = INIT_MQTT_DISC;
+                s_initStepMs = now;
+                s_initStepTimeout = 3000;
+                s_stepRetries = 0;
+
+                sendQmtDisc();
+            }
+            break;
+
+
+        case INIT_MQTT_DISC:
+            if (atReadCheck("+QMTDISC:") ||
+                atReadCheck("OK") ||
+                atHasError() ||
+                now - s_initStepMs > s_initStepTimeout)
+            {
+                Serial.println(F("[NB-IoT] MQTT disconnect terminat/ignorat."));
+                Serial.println(F("[NB-IoT] Inchid socket-ul MQTT..."));
+
+                s_initState = INIT_MQTT_CLOSE;
+                s_initStepMs = now;
+                s_initStepTimeout = 5000;
+                s_stepRetries = 0;
+
+                sendQmtClose();
+            }
+            break;
+
+
+        case INIT_MQTT_CLOSE:
+            if (atReadCheck("+QMTCLOSE:") ||
+                atReadCheck("OK") ||
+                atHasError() ||
+                now - s_initStepMs > s_initStepTimeout)
+            {
+                Serial.println(F("[NB-IoT] MQTT socket inchis/ignorat."));
+                Serial.println(F("[NB-IoT] Cooldown 5 secunde inainte de reconectare..."));
+
+                s_connected = false;
+
+                s_initState = INIT_RECONNECT_COOLDOWN;
+                s_initStepMs = now;
+                s_initStepTimeout = MQTT_RECONNECT_COOLDOWN_MS;
+                s_stepRetries = 0;
+            }
+            break;
+
+
+        case INIT_RECONNECT_COOLDOWN:
+            if (now - s_initStepMs >= MQTT_RECONNECT_COOLDOWN_MS) {
+                Serial.println(F("[NB-IoT] Reiau procesul complet de conectare..."));
+
+                s_connected = false;
+                s_network_ready = false;
+
+                s_atRetries = 0;
+                s_stepRetries = 0;
+                s_ceregRetries = 0;
+
+                s_initState = INIT_AT_TEST;
+                s_initStepMs = now;
+                s_initStepTimeout = 5000;
+
+                atWrite("AT");
             }
             break;
 
@@ -819,12 +992,20 @@ void nbiot_publish(const char* eventType,
             {
                 Serial.print(F("[MQTT] ERROR publish: "));
                 Serial.println(buf);
+
+                s_connected = false;
+                beginFullMqttReconnect(F("QMTPUB ERROR"));
+
                 smsSend(eventType, uid, stateStr);
                 return;
             }
         }
 
         Serial.println(F("[MQTT] Timeout publish"));
+
+        s_connected = false;
+        beginFullMqttReconnect(F("QMTPUB timeout"));
+
         smsSend(eventType, uid, stateStr);
         return;
     }
