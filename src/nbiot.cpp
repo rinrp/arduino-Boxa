@@ -2,11 +2,6 @@
 #include "config.h"
 #include <SoftwareSerial.h>
 
-// ============================================================
-//  nbiot.cpp — BC92 + MQTT Live Objects + fallback SMS
-//  OPTIMIZAT AGRESIV PENTRU COBORÂREA CONSUMULUI DE RAM (<66%)
-// ============================================================
-
 #define MODEM_BAUD  9600
 static SoftwareSerial s_modem(MODEM_RX_PIN, MODEM_TX_PIN);
 
@@ -204,10 +199,10 @@ void nbiot_initTick() {
             if (atReadCheck("OK")) {
                 s_initState       = INIT_APN;
                 s_initStepMs      = now;
-                s_initStepTimeout = 5000;
+                s_initStepTimeout = 10000;
                 s_stepRetries     = 0;
                 Serial.println(F("[NB-IoT] Echo disabled."));
-                atWrite(F("AT+QICSGP=1,1,\"net\",\"\",\"\",1"));
+                atWrite(F("AT+QICSGP=1,1,\"\",\"\",\"\",1"));
             } else if (now - s_initStepMs > 2000) {
                 s_stepRetries++;
                 if (s_stepRetries >= 3) {
@@ -236,7 +231,7 @@ void nbiot_initTick() {
                     s_initState = INIT_FAILED;
                 } else {
                     s_initStepMs = now;
-                    atWrite(F("AT+QICSGP=1,1,\"net\",\"\",\"\",1"));
+                    atWrite(F("AT+QICSGP=1,1,\"\",\"\",\"\",1"));
                 }
             }
             break;
@@ -301,7 +296,7 @@ void nbiot_initTick() {
                 s_stepRetries     = 0;
                 
                 s_modem.print(F("AT+QMTCONN=0,\""));
-                s_modem.print(LO_DEVICE_ID);
+                s_modem.print(LO_MQTT_CLIENT);
                 s_modem.print(F("\",\""));
                 s_modem.print(LO_MQTT_USER);
                 s_modem.print(F("\",\""));
@@ -360,7 +355,7 @@ void nbiot_initTick() {
                     s_atPos = 0;
                     memset(s_atBuf, 0, sizeof(s_atBuf));
                     s_modem.print(F("AT+QMTCONN=0,\""));
-                    s_modem.print(LO_DEVICE_ID);
+                    s_modem.print(LO_MQTT_CLIENT);
                     s_modem.print(F("\",\""));
                     s_modem.print(LO_MQTT_USER);
                     s_modem.print(F("\",\""));
@@ -401,6 +396,13 @@ void nbiot_initTick() {
 }
 
 void nbiot_publish(const char* eventType, const char* uid, const char* stateStr) {
+    // Nu trimitem nimic cât timp modemul se inițializează
+    if (s_initState != INIT_DONE && s_initState != INIT_FAILED)
+    {
+        Serial.print(F("[NB-IoT] Init in curs, eveniment ignorat: "));
+        Serial.println(eventType);
+        return;
+    }
     if (s_connected) {
         // !!! OPTIMIZARE: Trimitem payload-ul JSON fragmentat direct pe serială, salvând 500 de octeți de stivă !!!
         s_modem.print(F("AT+QMTPUB=0,1,0,0,\""));

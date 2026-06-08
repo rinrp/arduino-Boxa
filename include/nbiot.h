@@ -1,44 +1,11 @@
 #ifndef NBIOT_H
 #define NBIOT_H
-
 #include <Arduino.h>
-//  !! PLACEHOLDER-E — înlocuiește cu valorile tale reale !!
-//
-//  LO_API_KEY    → cheia API din Live Objects
-//                  (Settings → API Keys → Create)
-//                  Folosită ca parolă MQTT.
-//
-//  LO_DEVICE_ID  → ID-ul dispozitivului tău din Live Objects
-//                  (Devices → My Devices → Device ID)
-//                  Folosit ca Client ID MQTT.
-//
-//  LO_TOPIC_PUB  → topicul pe care publici date
-//                  Standard Live Objects: "dev/data"
-//
-//  LO_TOPIC_SUB  → topicul pe care primești comenzi
-//                  Standard Live Objects: "dev/cmd"
-//
-//  LO_MQTT_HOST  → brokerul MQTT Live Objects
-//                  Standard: "mqtt.liveobjects.orange-business.com"
-//
-//  LO_MQTT_PORT  → portul MQTT (8883 fără TLS)
 // ============================================================
-
-//  !! CREDENTIALE LIVE OBJECTS — nu le distribui public !!
-//
-//  LO_API_KEY     → cheia API (parola MQTT)
-//  LO_DEVICE_ID   → ID-ul dispozitivului (folosit la identificare)
-//  LO_MQTT_CLIENT → Client ID MQTT (unic per conexiune)
-//  LO_STREAM_ID   → Stream ID pentru date publicate
-//  LO_TOPIC_PUB   → topic publish date senzori
-//  LO_TOPIC_SUB   → topic subscribe comenzi
-//  LO_MQTT_HOST   → broker MQTT Live Objects
-//  LO_MQTT_PORT   → port MQTT (8883 fara TLS)
-//  LO_MQTT_USER   → username MQTT Live Objects (fix, nu modifica)
-
-#define LO_API_KEY      "API_KEY_TAU_NOU"
+#define LO_API_KEY      "4d248462f24c4f8d9a865c42019671bc"
 #define LO_DEVICE_ID    "urn:lo:nsid:mqtt:RFID"
 #define LO_STREAM_ID    "urn:lo:nsid:mqtt:RFID"
+#define LO_MQTT_CLIENT  "ArduinoRFID"
 
 #define LO_TOPIC_PUB    "dev/data"
 #define LO_TOPIC_SUB    "dev/cmd"
@@ -110,22 +77,7 @@ void nbiot_publish(const char* eventType,
 
 // ============================================================
 //  Primire comenzi din cloud
-// ============================================================
-
-/**
- * Verifică dacă au sosit comenzi pe topicul dev/cmd.
- * Apelați în fiecare iterație de loop().
- * Non-blocker — citește doar ce e disponibil în buffer.
- *
- * Comenzi suportate (JSON):
- *   {"cmd":"open"}                        → deschide yala
- *   {"cmd":"card_add","uid":"XX:XX:XX:XX"} → adaugă card
- *   {"cmd":"card_remove","uid":"XX:XX:XX:XX"} → elimină card
- *   {"cmd":"status"}                      → publică starea curentă
- *
- * Rezultatul comenzii este returnat prin callback-uri
- * (vezi nbiot_setCommandCallback).
- */
+// ===========================================================
 void nbiot_checkCommands();
 
 // ============================================================
@@ -162,13 +114,6 @@ void nbiot_setCommandCallback(NbiotCommandCallback cb);
 
 // ============================================================
 //  Utilitar: heartbeat periodic
-// ============================================================
-
-/**
- * Trimite periodic starea sistemului (heartbeat).
- * Apelați în loop() cu starea curentă.
- * Interval configurat în NBIOT_HEARTBEAT_MS.
- */
 void nbiot_heartbeatTick(const char* stateStr);
 
 #define NBIOT_HEARTBEAT_MS  30000UL  // heartbeat la 30 secunde
