@@ -1,12 +1,9 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// ===========================================================
 //  NU modifica pinii în altă parte decât aici.
-// ============================================================
 
 //  Pini hardware (conform configurației fizice)
-// Modem NB-IoT (rezervat, neutilizat în această versiune)
 #define MODEM_TX_PIN        2
 #define MODEM_RX_PIN        3
 
@@ -42,16 +39,13 @@ const byte UID_VALID[UID_VALID_LENGTH] = {0xCA, 0xFD, 0xA1, 0x80};
 //  Timing state machine (milisecunde)
 // ACCESS_GRANTED: delay între LED verde și activarea yălii (LED albastru)
 #define DELAY_YALA_MS           1000UL
-// ACCESS_GRANTED: cât timp așteptăm ușa să se deschidă după yală activă
-// Dacă ușa nu se deschide în acest interval → re-armare automată
+// ACCESS_GRANTED: cât timp așteptăm ușa să se deschidă după yală activă, Dacă ușa nu se deschide în acest interval → re-armare automată
 #define TIMEOUT_ASTEPTARE_USA_MS  6000UL
 // ACCESS_DENIED: cât timp rămâne aprins LED-ul roșu pentru card invalid
 #define DURATA_REFUZ_CARD_MS    2000UL
-// TEMP_OPEN: cât timp sunt active beep-urile butonului
-// La expirare, dacă ușa nu s-a deschis → re-armare automată
+// TEMP_OPEN: cât timp sunt active beep-urile butonului,La expirare, dacă ușa nu s-a deschis → re-armare automată
 #define TIMEOUT_BUTON_MS        9000UL
-// Perioada de stabilizare după închiderea ușii
-// Previne re-armarea imediată și eventualele bounce-uri ale senzorului
+// Perioada de stabilizare după închiderea ușii, Previne re-armarea imediată și eventualele bounce-uri ale senzorului
 #define DURATA_STABILIZARE_MS   2000UL
 // Timeout de siguranță pentru stabilizare (forțat reset dacă blochează)
 #define STABILIZARE_MAX_MS      (DURATA_STABILIZARE_MS * 30UL)
@@ -74,5 +68,6 @@ const byte UID_VALID[UID_VALID_LENGTH] = {0xCA, 0xFD, 0xA1, 0x80};
 //  Serial debug
 #define SERIAL_BAUD             9600
 #define LOG_INTERVAL_MS         1000UL  // interval afișare stare reed
+#define RUN_HARDWARE_DIAGNOSTIC 1
 
 #endif // CONFIG_H

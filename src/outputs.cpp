@@ -3,10 +3,8 @@
 // ============================================================
 //  outputs.cpp — Implementare ieșiri
 // ============================================================
-
-  
+ 
 //  State intern alarma
-  
 static bool          s_alarmActive      = false;
 static unsigned long s_lastAlarmTick    = 0;
 
@@ -16,8 +14,6 @@ static unsigned long s_lastButtonBeep   = 0;
 
   
 //  Inițializare
-  
-
 void outputs_init() {
     pinMode(LED_VERDE_PIN,    OUTPUT);
     pinMode(LED_ROSU_PIN,     OUTPUT);
@@ -33,8 +29,6 @@ void outputs_init() {
 
   
 //  LED-uri
-  
-
 void led_greenOn()  { digitalWrite(LED_VERDE_PIN,    HIGH); }
 void led_greenOff() { digitalWrite(LED_VERDE_PIN,    LOW);  }
 void led_redOn()    { digitalWrite(LED_ROSU_PIN,     HIGH); }
@@ -51,8 +45,6 @@ void led_allOff() {
 
   
 //  Buzzer — sunete blocante (durate scurte, acceptabil)
-  
-
 void buzzer_confirmSound() {
     tone(BUZZER_PIN, BUZZER_CONFIRM_FREQ, BUZZER_CONFIRM_DUR);
     delay(BUZZER_CONFIRM_DUR + 20);
@@ -66,8 +58,6 @@ void buzzer_errorSound() {
 
   
 //  Buzzer — alarmă non-blocantă
-  
-
 void buzzer_alarmStart() {
     s_alarmActive   = true;
     s_lastAlarmTick = millis();
@@ -92,12 +82,8 @@ void buzzer_alarmTick() {
 bool buzzer_isAlarmActive() {
     return s_alarmActive;
 }
-
-
   
 //  Buzzer — feedback buton (non-blocant, apelat din TEMP_OPEN)
-  
-
 void buzzer_buttonTick(unsigned long now, unsigned long startMs) {
     // Activ doar în fereastra TIMEOUT_BUTON_MS de la startMs
     if (now - startMs >= TIMEOUT_BUTON_MS) return;

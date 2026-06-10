@@ -1,53 +1,36 @@
 #include "cardmanager.h"
 #include "config.h"
 #include <EEPROM.h>
+#include <ctype.h>
 
-// ============================================================
-//  cardmanager.cpp — Implementare gestiune carduri RFID
-// ============================================================
+#define EEPROM_COUNT_ADDR 0
+#define EEPROM_DATA_ADDR  1
 
-// Layout EEPROM:
-//   Adresa EEPROM_BASE_ADDR:          număr carduri (byte)
-//   Adresa EEPROM_BASE_ADDR + 1 + i*4: UID-ul i (4 bytes)
-
-#define EEPROM_BASE_ADDR   0
-#define EEPROM_COUNT_ADDR  EEPROM_BASE_ADDR
-#define EEPROM_DATA_ADDR  (EEPROM_BASE_ADDR + 1)
-
-// Cache în RAM pentru acces rapid
-static byte s_cards[CARD_MAX_COUNT][CARD_UID_LENGTH];
 static byte s_count = 0;
 
-// ============================================================
-//  Helpers interni
-// ============================================================
-
-static void saveToEEPROM() {
-    EEPROM.update(EEPROM_COUNT_ADDR, s_count);
-    for (byte i = 0; i < s_count; i++) {
-        int addr = EEPROM_DATA_ADDR + i * CARD_UID_LENGTH;
-        for (byte b = 0; b < CARD_UID_LENGTH; b++) {
-            EEPROM.update(addr + b, s_cards[i][b]);
-        }
-    }
+static int uidAddr(byte index) {
+    return EEPROM_DATA_ADDR + (int)index * CARD_UID_LENGTH;
 }
 
-static bool uidEquals(const byte* a, const byte* b) {
-    for (byte i = 0; i < CARD_UID_LENGTH; i++) {
-        if (a[i] != b[i]) return false;
+static bool uidEqualsEEPROM(byte index, const byte* uid) {
+    int addr = uidAddr(index);
+    for (byte b = 0; b < CARD_UID_LENGTH; b++) {
+        if (EEPROM.read(addr + b) != uid[b]) return false;
     }
     return true;
 }
 
-// ============================================================
-//  Inițializare
-// ============================================================
+static void writeUID(byte index, const byte* uid) {
+    int addr = uidAddr(index);
+    for (byte b = 0; b < CARD_UID_LENGTH; b++) {
+        EEPROM.update(addr + b, uid[b]);
+    }
+}
 
 static bool isEEPROMBlank() {
+    if (EEPROM.read(EEPROM_COUNT_ADDR) != 0xFF) return false;
     for (byte b = 0; b < CARD_UID_LENGTH; b++) {
-        if (EEPROM.read(EEPROM_DATA_ADDR + b) != 0xFF) {
-            return false;
-        }
+        if (EEPROM.read(EEPROM_DATA_ADDR + b) != 0xFF) return false;
     }
     return true;
 }
@@ -55,24 +38,13 @@ static bool isEEPROMBlank() {
 void cardmanager_init() {
     s_count = EEPROM.read(EEPROM_COUNT_ADDR);
 
-    // Validare: dacă EEPROM-ul e neiniţializat (0xFF) sau corupt
-    if (s_count == 0xFF || s_count > CARD_MAX_COUNT ||
-        (s_count == 0 && isEEPROMBlank())) {
+    if (s_count == 0xFF || s_count > CARD_MAX_COUNT || isEEPROMBlank()) {
         s_count = 1;
-        for (byte b = 0; b < CARD_UID_LENGTH; b++) {
-            s_cards[0][b] = UID_VALID[b];
-        }
-        saveToEEPROM();
-        Serial.println(F("CardManager: primul boot - card CA:FD:A1:80 adaugat"));
+        EEPROM.update(EEPROM_COUNT_ADDR, s_count);
+        writeUID(0, UID_VALID);
+        Serial.println(F("CardManager: primul boot - card default adaugat"));
+        cardmanager_printAll();
         return;
-    }
-
-    // Încarcă cardurile în cache RAM
-    for (byte i = 0; i < s_count; i++) {
-        int addr = EEPROM_DATA_ADDR + i * CARD_UID_LENGTH;
-        for (byte b = 0; b < CARD_UID_LENGTH; b++) {
-            s_cards[i][b] = EEPROM.read(addr + b);
-        }
     }
 
     Serial.print(F("CardManager: "));
@@ -81,70 +53,61 @@ void cardmanager_init() {
     cardmanager_printAll();
 }
 
-// ============================================================
-//  Verificare
-// ============================================================
-
 bool cardmanager_isValid(const byte* uid) {
+    if (!uid) return false;
     for (byte i = 0; i < s_count; i++) {
-        if (uidEquals(s_cards[i], uid)) return true;
+        if (uidEqualsEEPROM(i, uid)) return true;
     }
     return false;
 }
 
-// ============================================================
-//  Adăugare
-// ============================================================
-
 bool cardmanager_add(const byte* uid) {
-    // Verifică dacă există deja
+    if (!uid) return false;
+
     if (cardmanager_isValid(uid)) {
-        Serial.println(F("CardManager: card deja existent, ignorat"));
+        Serial.println(F("CardManager: card deja existent"));
         return false;
     }
-    // Verifică capacitate
+
     if (s_count >= CARD_MAX_COUNT) {
-        Serial.println(F("CardManager: lista plina!"));
+        Serial.println(F("CardManager: lista plina"));
         return false;
     }
-    // Adaugă în cache și salvează
-    for (byte b = 0; b < CARD_UID_LENGTH; b++) {
-        s_cards[s_count][b] = uid[b];
-    }
+
+    writeUID(s_count, uid);
     s_count++;
-    saveToEEPROM();
+    EEPROM.update(EEPROM_COUNT_ADDR, s_count);
 
     Serial.print(F("CardManager: card adaugat, total="));
     Serial.println(s_count);
     return true;
 }
 
-// ============================================================
-//  Ștergere
-// ============================================================
-
 bool cardmanager_remove(const byte* uid) {
+    if (!uid) return false;
+
     for (byte i = 0; i < s_count; i++) {
-        if (uidEquals(s_cards[i], uid)) {
-            // Mută ultimul card pe poziția i (swap cu ultimul)
+        if (uidEqualsEEPROM(i, uid)) {
+            byte last[CARD_UID_LENGTH];
+            int lastAddr = uidAddr(s_count - 1);
+
             for (byte b = 0; b < CARD_UID_LENGTH; b++) {
-                s_cards[i][b] = s_cards[s_count - 1][b];
+                last[b] = EEPROM.read(lastAddr + b);
             }
+
+            writeUID(i, last);
             s_count--;
-            saveToEEPROM();
+            EEPROM.update(EEPROM_COUNT_ADDR, s_count);
 
             Serial.print(F("CardManager: card eliminat, total="));
             Serial.println(s_count);
             return true;
         }
     }
-    Serial.println(F("CardManager: card negasit pentru eliminare"));
+
+    Serial.println(F("CardManager: card negasit"));
     return false;
 }
-
-// ============================================================
-//  Utilitare
-// ============================================================
 
 byte cardmanager_count() {
     return s_count;
@@ -155,45 +118,48 @@ void cardmanager_printAll() {
         Serial.println(F("CardManager: niciun card autorizat"));
         return;
     }
+
     for (byte i = 0; i < s_count; i++) {
         Serial.print(F("  Card "));
         Serial.print(i);
         Serial.print(F(": "));
+
+        int addr = uidAddr(i);
         for (byte b = 0; b < CARD_UID_LENGTH; b++) {
-            if (s_cards[i][b] < 0x10) Serial.print('0');
-            Serial.print(s_cards[i][b], HEX);
+            byte v = EEPROM.read(addr + b);
+            if (v < 0x10) Serial.print('0');
+            Serial.print(v, HEX);
             if (b < CARD_UID_LENGTH - 1) Serial.print(':');
         }
         Serial.println();
     }
 }
 
+static int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
 bool cardmanager_parseUID(const char* str, byte* uidOut) {
-    // Format așteptat: "CA:FD:A1:80" (cu sau fără două puncte)
+    if (!str || !uidOut) return false;
+
     byte idx = 0;
     const char* p = str;
 
     while (*p && idx < CARD_UID_LENGTH) {
-        // Citește un byte hex (2 caractere)
-        char hi = *p++;
-        char lo = *p++;
+        if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1])) return false;
 
-        auto hexVal = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-            return -1;
-        };
-
-        int h = hexVal(hi);
-        int l = hexVal(lo);
+        int h = hexVal(p[0]);
+        int l = hexVal(p[1]);
         if (h < 0 || l < 0) return false;
 
         uidOut[idx++] = (byte)((h << 4) | l);
+        p += 2;
 
-        // Sare peste separator ':' dacă există
         if (*p == ':') p++;
     }
 
-    return (idx == CARD_UID_LENGTH);
+    return idx == CARD_UID_LENGTH && *p == '\0';
 }

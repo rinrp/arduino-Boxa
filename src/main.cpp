@@ -7,12 +7,7 @@
 #include "nbiot.h"
 #include "diagnostics.h"
 
-
-// ============================================================
-//  Definiție stări
-// ============================================================
-
-enum State {
+enum State : byte {
     IDLE,
     ACCESS_GRANTED,
     ACCESS_DENIED,
@@ -20,101 +15,55 @@ enum State {
     ALARM
 };
 
-
-// ============================================================
-//  Variabile globale state machine
-// ============================================================
-
-static State         g_state             = IDLE;
-static unsigned long g_stateEntryMs      = 0;
-
-// ACCESS_GRANTED
-static bool          g_yalaActive        = false;
-static unsigned long g_yalaActivatedMs   = 0;
-static bool          g_doorOpenedInCycle = false;
-static char          g_lastUID[15]       = "";
-
-// TEMP_OPEN
-static bool          g_doorOpenedByBtn   = false;
-
-// Stabilizare la închiderea ușii
-static bool          g_stabilizing       = false;
-static unsigned long g_stabilizeStartMs  = 0;
-
-// Log periodic reed
-static unsigned long g_lastLogMs         = 0;
-static int           g_prevReedRaw       = -1;
-
-// Deschidere remotă comandată din cloud
-static bool          g_remoteOpenPending = false;
-
-// NB-IoT service throttling
-static unsigned long g_lastNbiotTickMs   = 0;
-static unsigned long g_lastHeartbeatMs   = 0;
-
-
-// ============================================================
-//  Coadă simplă pentru evenimente NB-IoT
-//  Scop: nu apelăm nbiot_publish() direct în mijlocul RFID/alarmă.
-// ============================================================
-
-#define EVENT_QUEUE_SIZE 5
-#define EVENT_NAME_MAX   24
-#define EVENT_UID_MAX    15
-#define EVENT_STATE_MAX  20
-
-struct PendingEvent {
-    char event[EVENT_NAME_MAX];
-    char uid[EVENT_UID_MAX];
-    char state[EVENT_STATE_MAX];
+enum EventCode : byte {
+    EV_NONE,
+    EV_ACCESS_GRANTED,
+    EV_ACCESS_DENIED,
+    EV_DOOR_OPEN,
+    EV_DOOR_CLOSED,
+    EV_ALARM_START,
+    EV_ALARM_STOP,
+    EV_SYSTEM_STATUS,
+    EV_CARD_ADDED,
+    EV_CARD_REMOVED,
+    EV_REMOTE_OPEN
 };
 
-static PendingEvent g_eventQueue[EVENT_QUEUE_SIZE];
-static byte g_eventHead = 0;
-static byte g_eventTail = 0;
-static byte g_eventCount = 0;
+#define EVENT_QUEUE_SIZE 4
 
-static bool queueEvent(const char* eventType,
-                       const char* uid,
-                       const char* stateStr)
-{
-    if (g_eventCount >= EVENT_QUEUE_SIZE) {
-        Serial.print(F("[QUEUE] Plina, eveniment pierdut: "));
-        Serial.println(eventType);
-        return false;
-    }
+struct PendingEvent {
+    EventCode code;
+    State state;
+    char uid[15];
+};
 
-    strncpy(g_eventQueue[g_eventTail].event, eventType ? eventType : "", EVENT_NAME_MAX - 1);
-    g_eventQueue[g_eventTail].event[EVENT_NAME_MAX - 1] = '\0';
+static State g_state = IDLE;
+static unsigned long g_stateEntryMs = 0;
 
-    strncpy(g_eventQueue[g_eventTail].uid, uid ? uid : "", EVENT_UID_MAX - 1);
-    g_eventQueue[g_eventTail].uid[EVENT_UID_MAX - 1] = '\0';
+static bool g_yalaActive = false;
+static unsigned long g_yalaActivatedMs = 0;
+static bool g_doorOpenedInCycle = false;
 
-    strncpy(g_eventQueue[g_eventTail].state, stateStr ? stateStr : "", EVENT_STATE_MAX - 1);
-    g_eventQueue[g_eventTail].state[EVENT_STATE_MAX - 1] = '\0';
+static char g_lastUID[15] = "";
 
-    g_eventTail = (g_eventTail + 1) % EVENT_QUEUE_SIZE;
-    g_eventCount++;
+static bool g_doorOpenedByBtn = false;
 
-    return true;
-}
+static bool g_stabilizing = false;
+static unsigned long g_stabilizeStartMs = 0;
 
-static bool popEvent(PendingEvent& out)
-{
-    if (g_eventCount == 0) return false;
+static unsigned long g_lastLogMs = 0;
+static int g_prevReedRaw = -1;
 
-    out = g_eventQueue[g_eventHead];
+static bool g_remoteOpenPending = false;
 
-    g_eventHead = (g_eventHead + 1) % EVENT_QUEUE_SIZE;
-    g_eventCount--;
+static unsigned long g_lastNbiotTickMs = 0;
+static unsigned long g_lastPublishAttemptMs = 0;
+static unsigned long g_lastHeartbeatQueueMs = 0;
 
-    return true;
-}
-
-
-// ============================================================
-//  Helper: nume stare
-// ============================================================
+static PendingEvent g_queue[EVENT_QUEUE_SIZE];
+static byte g_qHead = 0;
+static byte g_qTail = 0;
+static byte g_qCount = 0;
 
 static const __FlashStringHelper* stateName(State s) {
     switch (s) {
@@ -134,7 +83,23 @@ static const char* stateNameStr(State s) {
         case ACCESS_DENIED:  return "ACCESS_DENIED";
         case TEMP_OPEN:      return "TEMP_OPEN";
         case ALARM:          return "ALARM";
-        default:             return "UNKNOWN";
+        default:             return "?";
+    }
+}
+
+static const char* eventName(EventCode e) {
+    switch (e) {
+        case EV_ACCESS_GRANTED: return EVT_ACCESS_GRANTED;
+        case EV_ACCESS_DENIED:  return EVT_ACCESS_DENIED;
+        case EV_DOOR_OPEN:      return EVT_DOOR_OPEN;
+        case EV_DOOR_CLOSED:    return EVT_DOOR_CLOSED;
+        case EV_ALARM_START:    return EVT_ALARM_START;
+        case EV_ALARM_STOP:     return EVT_ALARM_STOP;
+        case EV_SYSTEM_STATUS:  return EVT_SYSTEM_STATUS;
+        case EV_CARD_ADDED:     return EVT_CARD_ADDED;
+        case EV_CARD_REMOVED:   return EVT_CARD_REMOVED;
+        case EV_REMOTE_OPEN:    return EVT_REMOTE_OPEN;
+        default:                return "";
     }
 }
 
@@ -146,153 +111,117 @@ static void enterState(State next) {
     Serial.print(F(" -> "));
     Serial.println(stateName(next));
 
-    g_state        = next;
+    g_state = next;
     g_stateEntryMs = millis();
 }
 
+static bool queueEvent(EventCode code, const char* uid, State state) {
+    if (code == EV_NONE) return false;
 
-// ============================================================
-//  Helper: terminare ciclu cu stabilizare
-// ============================================================
+    if (g_qCount >= EVENT_QUEUE_SIZE) {
+        Serial.println(F("[Q] full"));
+        return false;
+    }
+
+    g_queue[g_qTail].code = code;
+    g_queue[g_qTail].state = state;
+
+    strncpy(g_queue[g_qTail].uid, uid ? uid : "", sizeof(g_queue[g_qTail].uid) - 1);
+    g_queue[g_qTail].uid[sizeof(g_queue[g_qTail].uid) - 1] = '\0';
+
+    g_qTail = (g_qTail + 1) % EVENT_QUEUE_SIZE;
+    g_qCount++;
+    return true;
+}
+
+static bool popEvent(PendingEvent* out) {
+    if (g_qCount == 0 || !out) return false;
+
+    *out = g_queue[g_qHead];
+    g_qHead = (g_qHead + 1) % EVENT_QUEUE_SIZE;
+    g_qCount--;
+    return true;
+}
 
 static void beginStabilization() {
     led_allOff();
 
-    g_stabilizing      = true;
+    g_stabilizing = true;
     g_stabilizeStartMs = millis();
 
     enterState(IDLE);
-
-    Serial.println(F("Stabilizare activa..."));
+    Serial.println(F("Stabilizare..."));
 }
-
-
-// ============================================================
-//  Callback comenzi NB-IoT
-// ============================================================
 
 static void onNbiotCommand(const NbiotCommand& cmd) {
     switch (cmd.type) {
-
         case CMD_OPEN:
-            Serial.println(F("[CMD] Remote: DESCHIDE USA"));
-            queueEvent(EVT_REMOTE_OPEN, "", stateNameStr(g_state));
+            Serial.println(F("[CMD] open"));
+            queueEvent(EV_REMOTE_OPEN, "", g_state);
 
             if (g_state == IDLE) {
                 g_remoteOpenPending = true;
-            } else {
-                Serial.println(F("[CMD] Ignorat: sistemul nu e in IDLE"));
             }
             break;
-
 
         case CMD_CARD_ADD: {
-            Serial.print(F("[CMD] Remote: ADAUGA CARD "));
-            Serial.println(cmd.uid);
-
             byte uid[4];
-
-            if (cardmanager_parseUID(cmd.uid, uid)) {
-                bool ok = cardmanager_add(uid);
-
-                queueEvent(ok ? EVT_CARD_ADDED : EVT_SYSTEM_STATUS,
-                           cmd.uid,
-                           ok ? "added" : "add_failed");
-            } else {
-                Serial.println(F("[CMD] card_add: UID invalid"));
-                queueEvent(EVT_SYSTEM_STATUS, cmd.uid, "uid_parse_error");
-            }
-
+            bool ok = cardmanager_parseUID(cmd.uid, uid) && cardmanager_add(uid);
+            queueEvent(ok ? EV_CARD_ADDED : EV_SYSTEM_STATUS, cmd.uid, g_state);
             break;
         }
-
 
         case CMD_CARD_REMOVE: {
-            Serial.print(F("[CMD] Remote: ELIMINA CARD "));
-            Serial.println(cmd.uid);
-
             byte uid[4];
-
-            if (cardmanager_parseUID(cmd.uid, uid)) {
-                bool ok = cardmanager_remove(uid);
-
-                queueEvent(ok ? EVT_CARD_REMOVED : EVT_SYSTEM_STATUS,
-                           cmd.uid,
-                           ok ? "removed" : "not_found");
-            } else {
-                Serial.println(F("[CMD] card_remove: UID invalid"));
-                queueEvent(EVT_SYSTEM_STATUS, cmd.uid, "uid_parse_error");
-            }
-
+            bool ok = cardmanager_parseUID(cmd.uid, uid) && cardmanager_remove(uid);
+            queueEvent(ok ? EV_CARD_REMOVED : EV_SYSTEM_STATUS, cmd.uid, g_state);
             break;
         }
 
-
         case CMD_STATUS:
-            Serial.println(F("[CMD] Remote: STATUS REQUEST"));
-            queueEvent(EVT_SYSTEM_STATUS, "", stateNameStr(g_state));
+            queueEvent(EV_SYSTEM_STATUS, "", g_state);
             break;
-
 
         default:
             break;
     }
 }
 
-
-// ============================================================
-//  setup()
-// ============================================================
-
 void setup() {
     Serial.begin(SERIAL_BAUD);
     while (!Serial);
 
     Serial.println(F("===================================="));
-    Serial.println(F("  Sistem control acces RFID v3.0   "));
-    Serial.println(F("  + NB-IoT / Orange Live Objects   "));
+    Serial.println(F("  Sistem control acces RFID v3.0"));
+    Serial.println(F("  + NB-IoT / Live Objects"));
     Serial.println(F("===================================="));
 
     access_init();
     outputs_init();
     sensors_init();
-
     cardmanager_init();
 
     nbiot_setCommandCallback(onNbiotCommand);
 
     if (!nbiot_init()) {
-        Serial.println(F("AVERTIZARE: NB-IoT offline. Sistem functional local."));
+        Serial.println(F("NB-IoT offline. Local OK."));
     }
 
+#if RUN_HARDWARE_DIAGNOSTIC
     diagnostics_runHardwareCheck();
+#endif
 
     led_allOff();
 
     Serial.println(F("Initializare completa"));
-    Serial.println();
 }
-
-
-// ============================================================
-//  loop()
-// ============================================================
 
 void loop() {
     unsigned long now = millis();
 
-    // ==========================================================
-    // 1. Ieșiri/alarmă locală — prioritate mare
-    // ==========================================================
-
     if (g_state == ALARM) {
         buzzer_alarmTick();
     }
-
-
-    // ==========================================================
-    // 2. Detectare schimbare reed
-    // ==========================================================
 
     int reedRaw = digitalRead(REED_PIN);
 
@@ -303,32 +232,18 @@ void loop() {
 
         Serial.print(F("STATUS="));
         Serial.print(reedRaw);
-        Serial.print(F("  USA="));
+        Serial.print(F(" USA="));
         Serial.print(isOpen ? F("DESCHISA") : F("INCHISA"));
-        Serial.print(F("  state="));
+        Serial.print(F(" state="));
         Serial.println(stateName(g_state));
 
-        queueEvent(
-            isOpen ? EVT_DOOR_OPEN : EVT_DOOR_CLOSED,
-            "",
-            stateNameStr(g_state)
-        );
+        queueEvent(isOpen ? EV_DOOR_OPEN : EV_DOOR_CLOSED, "", g_state);
     }
-
-
-    // ==========================================================
-    // 3. Log periodic stare ușă
-    // ==========================================================
 
     if (now - g_lastLogMs >= LOG_INTERVAL_MS) {
         g_lastLogMs = now;
         door_printState();
     }
-
-
-    // ==========================================================
-    // 4. Stabilizare post-închidere
-    // ==========================================================
 
     if (g_stabilizing) {
         if (now - g_stabilizeStartMs >= DURATA_STABILIZARE_MS) {
@@ -337,285 +252,178 @@ void loop() {
             Serial.println(F("Sistem ARMAT"));
         } else if (now - g_stabilizeStartMs > STABILIZARE_MAX_MS) {
             g_stabilizing = false;
-            Serial.println(F("AVERTIZARE: stabilizare reset fortat"));
+            Serial.println(F("Stabilizare reset"));
         }
+    } else {
+        switch (g_state) {
+            case IDLE:
+                led_allOff();
 
-        // Chiar și în stabilizare lăsăm NB-IoT să respire rar.
-        if (now - g_lastNbiotTickMs >= 250) {
-            g_lastNbiotTickMs = now;
-            nbiot_initTick();
-            nbiot_checkCommands();
-        }
+                if (g_remoteOpenPending) {
+                    g_remoteOpenPending = false;
 
-        return;
-    }
-
-
-    // ==========================================================
-    // 5. State machine local — RFID/senzori înainte de NB-IoT
-    // ==========================================================
-
-    switch (g_state) {
-
-        // ------------------------------------------------------
-        case IDLE:
-        // ------------------------------------------------------
-
-            led_allOff();
-
-            // --- Deschidere remotă din cloud ---
-            if (g_remoteOpenPending) {
-                g_remoteOpenPending = false;
-
-                Serial.println(F("Remote: deschidere autorizata din cloud"));
-
-                led_blueOn();
-                g_doorOpenedByBtn = false;
-
-                enterState(TEMP_OPEN);
-                break;
-            }
-
-
-            // --- Card RFID ---
-            if (access_isCardDetected()) {
-                access_printUID();
-                access_uidToString(g_lastUID, sizeof(g_lastUID));
-
-                if (cardmanager_isValid(access_getUID())) {
-                    Serial.println(F("Card: VALID - acces permis"));
-
-                    led_greenOn();
-                    buzzer_confirmSound();
-
-                    queueEvent(EVT_ACCESS_GRANTED,
-                               g_lastUID,
-                               "ACCESS_GRANTED");
-
-                    g_yalaActive        = false;
-                    g_doorOpenedInCycle = false;
-
-                    enterState(ACCESS_GRANTED);
-                } else {
-                    Serial.println(F("Card: INVALID - acces refuzat"));
-
-                    led_redOn();
-                    buzzer_errorSound();
-
-                    queueEvent(EVT_ACCESS_DENIED,
-                               g_lastUID,
-                               "ACCESS_DENIED");
-
-                    enterState(ACCESS_DENIED);
+                    Serial.println(F("Remote open"));
+                    led_blueOn();
+                    g_doorOpenedByBtn = false;
+                    enterState(TEMP_OPEN);
+                    break;
                 }
 
-                access_stopCommunication();
-            }
+                if (access_isCardDetected()) {
+                    access_uidToString(g_lastUID, sizeof(g_lastUID));
+                    access_printUID();
 
+                    if (cardmanager_isValid(access_getUID())) {
+                        Serial.println(F("Card VALID"));
+                        led_greenOn();
+                        buzzer_confirmSound();
 
-            // --- Buton deschidere manuală ---
-            if (button_wasPressed()) {
-                Serial.println(F("Buton: deschidere manuala"));
+                        queueEvent(EV_ACCESS_GRANTED, g_lastUID, ACCESS_GRANTED);
 
-                led_blueOn();
-                g_doorOpenedByBtn = false;
+                        g_yalaActive = false;
+                        g_doorOpenedInCycle = false;
+                        enterState(ACCESS_GRANTED);
+                    } else {
+                        Serial.println(F("Card INVALID"));
+                        led_redOn();
+                        buzzer_errorSound();
 
-                enterState(TEMP_OPEN);
-            }
+                        queueEvent(EV_ACCESS_DENIED, g_lastUID, ACCESS_DENIED);
+                        enterState(ACCESS_DENIED);
+                    }
 
+                    access_stopCommunication();
+                }
 
-            // --- Ușă forțată ---
-            if (door_isOpen()) {
-                Serial.println(F("ALARMA: Usa fortata!"));
+                if (button_wasPressed()) {
+                    Serial.println(F("Buton open"));
+                    led_blueOn();
+                    g_doorOpenedByBtn = false;
+                    enterState(TEMP_OPEN);
+                }
 
-                led_redOn();
-                buzzer_alarmStart();
-
-                enterState(ALARM);
-
-                queueEvent(EVT_ALARM_START, "", "ALARM");
-            }
-
-            break;
-
-
-        // ------------------------------------------------------
-        case ACCESS_GRANTED:
-        // ------------------------------------------------------
-
-            led_greenOn();
-
-            if (!g_yalaActive &&
-                now - g_stateEntryMs >= DELAY_YALA_MS)
-            {
-                led_blueOn();
-
-                g_yalaActive        = true;
-                g_yalaActivatedMs   = now;
-                g_doorOpenedInCycle = false;
-
-                Serial.println(F("Yala activa (LED albastru)"));
-            }
-
-            if (g_yalaActive) {
                 if (door_isOpen()) {
-                    g_doorOpenedInCycle = true;
+                    Serial.println(F("ALARMA: usa fortata"));
+                    led_redOn();
+                    buzzer_alarmStart();
+
+                    enterState(ALARM);
+                    queueEvent(EV_ALARM_START, "", ALARM);
                 }
-
-                if (g_doorOpenedInCycle && door_isClosed()) {
-                    Serial.println(F("Usa inchisa dupa acces valid -> stabilizare"));
-
-                    beginStabilization();
-
-                    g_yalaActive        = false;
-                    g_doorOpenedInCycle = false;
-
-                    break;
-                }
-
-                if (!g_doorOpenedInCycle &&
-                    now - g_yalaActivatedMs >= TIMEOUT_ASTEPTARE_USA_MS)
-                {
-                    Serial.println(F("Timeout: usa nu s-a deschis"));
-
-                    led_allOff();
-
-                    g_yalaActive = false;
-
-                    enterState(IDLE);
-
-                    break;
-                }
-            }
-
-            break;
-
-
-        // ------------------------------------------------------
-        case ACCESS_DENIED:
-        // ------------------------------------------------------
-
-            led_redOn();
-
-            if (now - g_stateEntryMs >= DURATA_REFUZ_CARD_MS) {
-                Serial.println(F("Card invalid: timeout -> IDLE"));
-
-                led_redOff();
-
-                enterState(IDLE);
-            }
-
-            if (door_isOpen()) {
-                Serial.println(F("ALARMA: Usa fortata in ACCESS_DENIED!"));
-
-                led_redOn();
-                buzzer_alarmStart();
-
-                queueEvent(EVT_ALARM_START, g_lastUID, "ALARM");
-
-                enterState(ALARM);
-            }
-
-            break;
-
-
-        // ------------------------------------------------------
-        case TEMP_OPEN:
-        // ------------------------------------------------------
-
-            led_blueOn();
-            buzzer_buttonTick(now, g_stateEntryMs);
-
-            if (door_isOpen()) {
-                g_doorOpenedByBtn = true;
-            }
-
-            if (g_doorOpenedByBtn && door_isClosed()) {
-                Serial.println(F("Usa inchisa dupa buton"));
-
-                noTone(BUZZER_PIN);
-
-                beginStabilization();
-
-                g_doorOpenedByBtn = false;
-
                 break;
-            }
 
-            if (now - g_stateEntryMs >= TIMEOUT_BUTON_MS) {
-                Serial.println(F("Buton timeout: usa neutilizata"));
+            case ACCESS_GRANTED:
+                led_greenOn();
 
-                noTone(BUZZER_PIN);
-                led_blueOff();
+                if (!g_yalaActive && now - g_stateEntryMs >= DELAY_YALA_MS) {
+                    led_blueOn();
+                    g_yalaActive = true;
+                    g_yalaActivatedMs = now;
+                    g_doorOpenedInCycle = false;
+                    Serial.println(F("Yala activa"));
+                }
 
-                g_doorOpenedByBtn = false;
+                if (g_yalaActive) {
+                    if (door_isOpen()) {
+                        g_doorOpenedInCycle = true;
+                    }
 
-                enterState(IDLE);
-            }
+                    if (g_doorOpenedInCycle && door_isClosed()) {
+                        Serial.println(F("Usa inchisa dupa acces"));
+                        g_yalaActive = false;
+                        g_doorOpenedInCycle = false;
+                        beginStabilization();
+                        break;
+                    }
 
-            break;
+                    if (!g_doorOpenedInCycle &&
+                        now - g_yalaActivatedMs >= TIMEOUT_ASTEPTARE_USA_MS)
+                    {
+                        Serial.println(F("Timeout usa"));
+                        led_allOff();
+                        g_yalaActive = false;
+                        enterState(IDLE);
+                    }
+                }
+                break;
 
+            case ACCESS_DENIED:
+                led_redOn();
 
-        // ------------------------------------------------------
-        case ALARM:
-        // ------------------------------------------------------
+                if (now - g_stateEntryMs >= DURATA_REFUZ_CARD_MS) {
+                    Serial.println(F("Refuz timeout"));
+                    led_redOff();
+                    enterState(IDLE);
+                }
 
-            led_redOn();
-            buzzer_alarmTick();
+                if (door_isOpen()) {
+                    Serial.println(F("ALARMA dupa card invalid"));
+                    led_redOn();
+                    buzzer_alarmStart();
 
-            if (door_isClosed()) {
-                Serial.println(F("Usa inchisa -> alarma oprita"));
+                    queueEvent(EV_ALARM_START, g_lastUID, ALARM);
+                    enterState(ALARM);
+                }
+                break;
 
-                buzzer_alarmStop();
-                led_redOff();
+            case TEMP_OPEN:
+                led_blueOn();
+                buzzer_buttonTick(now, g_stateEntryMs);
 
-                queueEvent(EVT_ALARM_STOP, "", "IDLE");
+                if (door_isOpen()) {
+                    g_doorOpenedByBtn = true;
+                }
 
-                enterState(IDLE);
-            }
+                if (g_doorOpenedByBtn && door_isClosed()) {
+                    Serial.println(F("Usa inchisa dupa buton"));
+                    noTone(BUZZER_PIN);
+                    g_doorOpenedByBtn = false;
+                    beginStabilization();
+                    break;
+                }
 
-            break;
+                if (now - g_stateEntryMs >= TIMEOUT_BUTON_MS) {
+                    Serial.println(F("Buton timeout"));
+                    noTone(BUZZER_PIN);
+                    led_blueOff();
+                    g_doorOpenedByBtn = false;
+                    enterState(IDLE);
+                }
+                break;
+
+            case ALARM:
+                led_redOn();
+                buzzer_alarmTick();
+
+                if (door_isClosed()) {
+                    Serial.println(F("Alarma oprita"));
+                    buzzer_alarmStop();
+                    led_redOff();
+
+                    queueEvent(EV_ALARM_STOP, "", IDLE);
+                    enterState(IDLE);
+                }
+                break;
+        }
     }
-
-
-    // ==========================================================
-    // 6. NB-IoT / MQTT — la final, rulat rar
-    // ==========================================================
 
     if (now - g_lastNbiotTickMs >= 250) {
         g_lastNbiotTickMs = now;
-
         nbiot_initTick();
         nbiot_checkCommands();
     }
 
-
-    // ==========================================================
-    // 7. Heartbeat — nu în timpul alarmei
-    // ==========================================================
-
-    if (g_state != ALARM &&
-        now - g_lastHeartbeatMs >= NBIOT_HEARTBEAT_MS)
-    {
-        g_lastHeartbeatMs = now;
-        queueEvent(EVT_SYSTEM_STATUS, "", stateNameStr(g_state));
+    if (g_state != ALARM && now - g_lastHeartbeatQueueMs >= NBIOT_HEARTBEAT_MS) {
+        g_lastHeartbeatQueueMs = now;
+        queueEvent(EV_SYSTEM_STATUS, "", g_state);
     }
 
-
-    // ==========================================================
-    // 8. Publicare evenimente — unul pe iterație controlată
-    //    Atenție: nbiot_publish poate bloca, de aceea este la final.
-    // ==========================================================
-
-    static unsigned long lastPublishAttemptMs = 0;
-
-    if (now - lastPublishAttemptMs >= 1000) {
-        lastPublishAttemptMs = now;
+    if (now - g_lastPublishAttemptMs >= 1200) {
+        g_lastPublishAttemptMs = now;
 
         PendingEvent ev;
-
-        if (popEvent(ev)) {
-            nbiot_publish(ev.event, ev.uid, ev.state);
+        if (popEvent(&ev)) {
+            nbiot_publish(eventName(ev.code), ev.uid, stateNameStr(ev.state));
         }
     }
 }

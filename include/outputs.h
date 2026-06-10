@@ -54,10 +54,7 @@ void buzzer_alarmTick();
 /** Returnează true dacă alarma este în curs. */
 bool buzzer_isAlarmActive();
 
-/**
- * Emite un bip scurt pentru feedback buton.
- * Non-blocker — folosit din starea TEMP_OPEN cu timer extern.
- */
+// Emite un bip scurt pentru feedback buton.  Non-blocker — folosit din starea TEMP_OPEN cu timer extern.
 void buzzer_buttonTick(unsigned long now, unsigned long startMs);
 
 #endif // OUTPUTS_H

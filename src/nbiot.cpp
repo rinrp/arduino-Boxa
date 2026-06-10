@@ -2,46 +2,33 @@
 #include "config.h"
 #include <SoftwareSerial.h>
 
-// ============================================================
-//  nbiot.cpp — Quectel BC92 + Orange Live Objects MQTT/SMS
-// ============================================================
-
 #define MODEM_BAUD 9600
 
 #define MQTT_RECONNECT_MAX_ATTEMPTS 5
 #define MQTT_RECONNECT_COOLDOWN_MS  5000UL
 
-// SoftwareSerial(rx, tx)
-// BC92 TX -> Arduino RX = MODEM_RX_PIN
-// BC92 RX -> Arduino TX = MODEM_TX_PIN
+#define AT_BUF_SIZE      112
+#define MQTT_BUF_SIZE    96
+#define PAYLOAD_BUF_SIZE 96
+
 static SoftwareSerial s_modem(MODEM_RX_PIN, MODEM_TX_PIN);
 
-
-// ============================================================
-//  State machine inițializare modem / MQTT
-// ============================================================
-
-enum InitState {
+enum InitState : byte {
     INIT_IDLE,
-
     INIT_AT_TEST,
     INIT_ECHO_OFF,
     INIT_APN,
     INIT_CEREG,
     INIT_CSQ,
-
     INIT_MQTT_VERSION,
     INIT_MQTT_SSL,
     INIT_MQTOPEN,
     INIT_MQTCONN,
     INIT_MQTSUB,
-
-    // Deconectare completă MQTT înainte de reconnect
     INIT_MQTT_UNSUB,
     INIT_MQTT_DISC,
     INIT_MQTT_CLOSE,
     INIT_RECONNECT_COOLDOWN,
-
     INIT_DONE,
     INIT_FAILED
 };
@@ -50,6 +37,7 @@ static InitState s_initState = INIT_IDLE;
 
 static unsigned long s_initStepMs = 0;
 static unsigned long s_initStepTimeout = 0;
+static unsigned long s_lastHeartbeatMs = 0;
 
 static byte s_atRetries = 0;
 static byte s_stepRetries = 0;
@@ -59,126 +47,96 @@ static byte s_mqttReconnectAttempts = 0;
 static bool s_connected = false;
 static bool s_network_ready = false;
 
-static unsigned long s_lastHeartbeatMs = 0;
-
 static NbiotCommandCallback s_cmdCallback = nullptr;
 
-
-// ============================================================
-//  Buffere
-// ============================================================
-
-static char s_atBuf[160];
+static char s_atBuf[AT_BUF_SIZE];
 static byte s_atPos = 0;
 
-static char s_mqttBuf[180];
+static char s_mqttBuf[MQTT_BUF_SIZE];
 static byte s_mqttPos = 0;
 
-
-// ============================================================
-//  Helper buffer AT
-// ============================================================
-
-static void clearAtBuffer() {
-    while (s_modem.available()) {
-        s_modem.read();
+static void readAtBuffer() {
+    while (s_modem.available() && s_atPos < sizeof(s_atBuf) - 1) {
+        char c = s_modem.read();
+        if (c == '\r') continue;
+        s_atBuf[s_atPos++] = c;
+        s_atBuf[s_atPos] = '\0';
     }
-
-    s_atPos = 0;
-    memset(s_atBuf, 0, sizeof(s_atBuf));
 }
 
-
-// ============================================================
-//  Helper comenzi AT
-// ============================================================
+static void clearAtBuffer() {
+    while (s_modem.available()) s_modem.read();
+    s_atPos = 0;
+    s_atBuf[0] = '\0';
+}
 
 static void atWrite(const char* cmd) {
     clearAtBuffer();
-
     s_modem.println(cmd);
-
     Serial.print(F("[AT>>] "));
     Serial.println(cmd);
-
-    delay(100);
+    delay(80);
 }
 
 static void atWrite(const __FlashStringHelper* cmd) {
     clearAtBuffer();
-
     s_modem.println(cmd);
-
     Serial.print(F("[AT>>] "));
     Serial.println(cmd);
+    delay(80);
+}
 
-    delay(100);
+static bool atContains(const char* text) {
+    readAtBuffer();
+    return strstr(s_atBuf, text) != nullptr;
 }
 
 static bool atReadCheck(const char* expect) {
-    delay(50);
-
-    while (s_modem.available() && s_atPos < sizeof(s_atBuf) - 1) {
-        char c = s_modem.read();
-
-        if (c == '\r') continue;
-
-        s_atBuf[s_atPos++] = c;
-        s_atBuf[s_atPos] = '\0';
-    }
-
+    delay(40);
+    readAtBuffer();
     if (strstr(s_atBuf, expect)) {
         Serial.print(F("[AT<<] "));
         Serial.println(s_atBuf);
         return true;
     }
-
     return false;
 }
 
 static bool atHasError() {
+    readAtBuffer();
     return strstr(s_atBuf, "ERROR") != nullptr ||
            strstr(s_atBuf, "+CME ERROR") != nullptr ||
            strstr(s_atBuf, "+CMS ERROR") != nullptr;
 }
 
 static void printRawIfAny() {
+    readAtBuffer();
     if (s_atPos > 0) {
         Serial.print(F("[AT RAW] "));
         Serial.println(s_atBuf);
     }
 }
 
-
-// ============================================================
-//  AT blocking helper pentru SMS / publish
-// ============================================================
-
 static bool atSendBlocking(const char* cmd,
                            const char* expect,
                            unsigned long timeoutMs)
 {
-    while (s_modem.available()) {
-        s_modem.read();
-    }
+    while (s_modem.available()) s_modem.read();
 
-    if (cmd && cmd[0] != '\0') {
+    if (cmd && cmd[0]) {
         s_modem.println(cmd);
-
         Serial.print(F("[AT>>] "));
         Serial.println(cmd);
     }
 
-    char buf[160];
+    char buf[80];
     byte pos = 0;
-    memset(buf, 0, sizeof(buf));
+    buf[0] = '\0';
 
     unsigned long start = millis();
-
     while (millis() - start < timeoutMs) {
         while (s_modem.available() && pos < sizeof(buf) - 1) {
             char c = s_modem.read();
-
             if (c == '\r') continue;
 
             buf[pos++] = c;
@@ -201,49 +159,28 @@ static bool atSendBlocking(const char* cmd,
         }
     }
 
-    Serial.println(F("[AT] timeout blocker"));
+    Serial.println(F("[AT] timeout"));
     return false;
 }
 
 static bool waitPrompt(unsigned long timeoutMs) {
     unsigned long start = millis();
-
     while (millis() - start < timeoutMs) {
         while (s_modem.available()) {
-            char c = s_modem.read();
-
-            if (c == '>') {
-                return true;
-            }
+            if (s_modem.read() == '>') return true;
         }
     }
-
     return false;
 }
 
-
-// ============================================================
-//  Parsare CSQ
-// ============================================================
-
 static int parseCsqRssi() {
     const char* p = strstr(s_atBuf, "+CSQ:");
-
     if (!p) return -1;
 
     p += 5;
-
-    while (*p == ' ') {
-        p++;
-    }
-
+    while (*p == ' ') p++;
     return atoi(p);
 }
-
-
-// ============================================================
-//  Helper MQTT
-// ============================================================
 
 static void sendQmtOpen() {
     clearAtBuffer();
@@ -254,12 +191,9 @@ static void sendQmtOpen() {
     s_modem.print(LO_MQTT_PORT);
     s_modem.println();
 
-    Serial.print(F("[AT>>] AT+QMTOPEN=0,\""));
-    Serial.print(LO_MQTT_HOST);
-    Serial.print(F("\","));
-    Serial.println(LO_MQTT_PORT);
-
-    delay(100);
+    Serial.print(F("[AT>>] QMTOPEN "));
+    Serial.println(LO_MQTT_HOST);
+    delay(80);
 }
 
 static void sendQmtConn() {
@@ -273,13 +207,8 @@ static void sendQmtConn() {
     s_modem.print(LO_API_KEY);
     s_modem.println(F("\""));
 
-    Serial.print(F("[AT>>] AT+QMTCONN=0,\""));
-    Serial.print(LO_MQTT_CLIENT);
-    Serial.print(F("\",\""));
-    Serial.print(LO_MQTT_USER);
-    Serial.println(F("\",\"***\""));
-
-    delay(100);
+    Serial.println(F("[AT>>] QMTCONN ***"));
+    delay(80);
 }
 
 static void sendQmtSub() {
@@ -289,11 +218,9 @@ static void sendQmtSub() {
     s_modem.print(LO_TOPIC_SUB);
     s_modem.println(F("\",1"));
 
-    Serial.print(F("[AT>>] AT+QMTSUB=0,1,\""));
-    Serial.print(LO_TOPIC_SUB);
-    Serial.println(F("\",1"));
-
-    delay(100);
+    Serial.print(F("[AT>>] QMTSUB "));
+    Serial.println(LO_TOPIC_SUB);
+    delay(80);
 }
 
 static void sendQmtUnsub() {
@@ -303,119 +230,89 @@ static void sendQmtUnsub() {
     s_modem.print(LO_TOPIC_SUB);
     s_modem.println(F("\""));
 
-    Serial.print(F("[AT>>] AT+QMTUNS=0,2,\""));
-    Serial.print(LO_TOPIC_SUB);
-    Serial.println(F("\""));
-
-    delay(100);
+    Serial.println(F("[AT>>] QMTUNS"));
+    delay(80);
 }
 
 static void sendQmtDisc() {
     clearAtBuffer();
-
     s_modem.println(F("AT+QMTDISC=0"));
-
-    Serial.println(F("[AT>>] AT+QMTDISC=0"));
-
-    delay(100);
+    Serial.println(F("[AT>>] QMTDISC"));
+    delay(80);
 }
 
 static void sendQmtClose() {
     clearAtBuffer();
-
     s_modem.println(F("AT+QMTCLOSE=0"));
-
-    Serial.println(F("[AT>>] AT+QMTCLOSE=0"));
-
-    delay(100);
+    Serial.println(F("[AT>>] QMTCLOSE"));
+    delay(80);
 }
 
-
-// ============================================================
-//  Reconnect complet MQTT
-// ============================================================
-
 static void beginFullMqttReconnect(const __FlashStringHelper* reason) {
-    Serial.print(F("[NB-IoT] Reconnect MQTT complet cerut: "));
+    Serial.print(F("[NB] Reconnect: "));
     Serial.println(reason);
 
     s_connected = false;
 
     if (s_mqttReconnectAttempts >= MQTT_RECONNECT_MAX_ATTEMPTS) {
-        Serial.println(F("[NB-IoT] EROARE: reconnect MQTT esuat dupa 5 incercari."));
-        Serial.println(F("[NB-IoT] Sistemul ramane functional LOCAL."));
+        Serial.println(F("[NB] MQTT failed. Local mode."));
         s_initState = INIT_FAILED;
         return;
     }
 
     s_mqttReconnectAttempts++;
-
-    Serial.print(F("[NB-IoT] Reconnect attempt "));
+    Serial.print(F("[NB] Retry "));
     Serial.print(s_mqttReconnectAttempts);
-    Serial.print(F("/"));
+    Serial.print('/');
     Serial.println(MQTT_RECONNECT_MAX_ATTEMPTS);
 
     s_stepRetries = 0;
     s_initStepMs = millis();
-    s_initStepTimeout = 3000;
-
+    s_initStepTimeout = 2500;
     s_initState = INIT_MQTT_UNSUB;
     sendQmtUnsub();
 }
-
-
-// ============================================================
-//  SMS fallback către Live Objects
-// ============================================================
 
 static void smsSend(const char* eventType,
                     const char* uid,
                     const char* stateStr)
 {
-    Serial.print(F("[SMS] Trimit catre "));
-    Serial.print(LO_SMS_ADMIN_NR);
-    Serial.print(F(": "));
-    Serial.print(eventType);
-    Serial.print(F(" / "));
-    Serial.println(stateStr);
+    Serial.print(F("[SMS] "));
+    Serial.println(eventType);
 
-    atSendBlocking("AT+CGSMS=2", "OK", 1500);
-    atSendBlocking("AT+CMGF=1", "OK", 2000);
-    atSendBlocking("AT+CSCS=\"GSM\"", "OK", 2000);
+    atSendBlocking("AT+CGSMS=2", "OK", 1200);
+    atSendBlocking("AT+CMGF=1", "OK", 1800);
 
-    char cmd[36];
+    char cmd[28];
     snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"", LO_SMS_ADMIN_NR);
 
-    if (!atSendBlocking(cmd, ">", 5000)) {
-        Serial.println(F("[SMS] EROARE: modemul nu a oferit prompt >"));
+    if (!atSendBlocking(cmd, ">", 4500)) {
+        Serial.println(F("[SMS] no prompt"));
         s_modem.write(27);
         return;
     }
 
     s_modem.print(F("EVT:"));
     s_modem.print(eventType);
-
     s_modem.print(F(",ST:"));
-    s_modem.print(stateStr);
+    s_modem.print(stateStr ? stateStr : "");
 
-    if (uid && uid[0] != '\0') {
+    if (uid && uid[0]) {
         s_modem.print(F(",UID:"));
         s_modem.print(uid);
     }
 
-    delay(300);
+    delay(200);
     s_modem.write(26);
 
-    char buf[120];
+    char buf[64];
     byte pos = 0;
-    memset(buf, 0, sizeof(buf));
+    buf[0] = '\0';
 
     unsigned long start = millis();
-
-    while (millis() - start < 12000) {
+    while (millis() - start < 10000) {
         while (s_modem.available() && pos < sizeof(buf) - 1) {
             char c = s_modem.read();
-
             if (c == '\r') continue;
 
             buf[pos++] = c;
@@ -423,32 +320,25 @@ static void smsSend(const char* eventType,
         }
 
         if (strstr(buf, "+CMGS:") || strstr(buf, "OK")) {
-            Serial.println(F("[SMS] Trimis cu succes!"));
+            Serial.println(F("[SMS] OK"));
             return;
         }
 
-        if (strstr(buf, "ERROR") || strstr(buf, "+CMS ERROR")) {
-            Serial.print(F("[SMS] EROARE: "));
+        if (strstr(buf, "ERROR")) {
+            Serial.print(F("[SMS] ERR "));
             Serial.println(buf);
             return;
         }
     }
 
-    Serial.println(F("[SMS] timeout trimitere"));
+    Serial.println(F("[SMS] timeout"));
 }
-
-
-// ============================================================
-//  Inițializare
-// ============================================================
 
 bool nbiot_init() {
     s_modem.begin(MODEM_BAUD);
-    delay(800);
+    delay(600);
 
-    Serial.println(F("[NB-IoT] Pornire initializare non-blocanta..."));
-    Serial.println(F("[NB-IoT] RFID/senzori functioneaza imediat."));
-    Serial.println(F("[NB-IoT] Conectare cloud in background..."));
+    Serial.println(F("[NB] init background"));
 
     s_connected = false;
     s_network_ready = false;
@@ -458,73 +348,57 @@ bool nbiot_init() {
     s_ceregRetries = 0;
     s_mqttReconnectAttempts = 0;
 
+    s_atPos = 0;
+    s_mqttPos = 0;
+    s_atBuf[0] = '\0';
+    s_mqttBuf[0] = '\0';
+
     s_initState = INIT_AT_TEST;
     s_initStepMs = millis();
     s_initStepTimeout = 5000;
 
     atWrite("AT");
-
     return true;
 }
 
-
-// ============================================================
-//  State machine inițializare
-// ============================================================
-
 void nbiot_initTick() {
-    if (s_initState == INIT_DONE || s_initState == INIT_FAILED) return;
-    if (s_initState == INIT_IDLE) return;
+    if (s_initState == INIT_DONE || s_initState == INIT_FAILED || s_initState == INIT_IDLE) return;
 
     unsigned long now = millis();
 
     switch (s_initState) {
-
         case INIT_AT_TEST:
             if (atReadCheck("OK")) {
-                Serial.println(F("[NB-IoT] Modem raspunde!"));
-
+                Serial.println(F("[NB] modem OK"));
                 s_initState = INIT_ECHO_OFF;
                 s_initStepMs = now;
                 s_initStepTimeout = 3000;
                 s_stepRetries = 0;
-
                 atWrite("ATE0");
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_atRetries++;
-
                 if (s_atRetries >= 5) {
-                    Serial.println(F("[NB-IoT] EROARE: modem nu raspunde dupa 5 incercari"));
-                    Serial.println(F("[NB-IoT] Verifica TX/RX, alimentare, antena, S201, S101."));
-                    Serial.println(F("[NB-IoT] Sistem functional local. SMS/MQTT indisponibil."));
+                    Serial.println(F("[NB] modem offline"));
                     s_initState = INIT_FAILED;
                 } else {
-                    Serial.print(F("[NB-IoT] Reincercare AT "));
-                    Serial.print(s_atRetries);
-                    Serial.println(F("/5..."));
-
                     s_initStepMs = now;
                     atWrite("AT");
                 }
             }
             break;
 
-
         case INIT_ECHO_OFF:
             if (atReadCheck("OK")) {
-                Serial.println(F("[NB-IoT] Echo disabled."));
-
+                Serial.println(F("[NB] echo off"));
                 s_initState = INIT_APN;
                 s_initStepMs = now;
                 s_initStepTimeout = 10000;
                 s_stepRetries = 0;
-
                 atWrite(F("AT+QCGDEFCONT=\"IP\",\"net\""));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-
                 if (s_stepRetries >= 3) {
-                    Serial.println(F("[NB-IoT] EROARE: ATE0 esuat"));
+                    Serial.println(F("[NB] ATE0 fail"));
                     printRawIfAny();
                     s_initState = INIT_FAILED;
                 } else {
@@ -534,108 +408,80 @@ void nbiot_initTick() {
             }
             break;
 
-
         case INIT_APN:
             if (atReadCheck("OK")) {
-                Serial.println(F("[NB-IoT] APN configurat. Verific retea..."));
-
+                Serial.println(F("[NB] APN OK"));
                 s_initState = INIT_CEREG;
                 s_initStepMs = now;
                 s_initStepTimeout = 5000;
                 s_ceregRetries = 0;
-
                 atWrite(F("AT+CEREG?"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-
                 if (s_stepRetries >= 3) {
-                    Serial.println(F("[NB-IoT] EROARE: configurare APN esuata"));
+                    Serial.println(F("[NB] APN fail"));
                     printRawIfAny();
                     s_initState = INIT_FAILED;
                 } else {
-                    Serial.print(F("[NB-IoT] Reincercare APN "));
-                    Serial.print(s_stepRetries);
-                    Serial.println(F("/3..."));
-
                     s_initStepMs = now;
                     atWrite(F("AT+QCGDEFCONT=\"IP\",\"net\""));
                 }
             }
             break;
 
-
         case INIT_CEREG:
             if (atReadCheck("+CEREG: 0,1") ||
-                atReadCheck("+CEREG: 0,5") ||
-                atReadCheck("+CEREG: 1,1") ||
-                atReadCheck("+CEREG: 1,5"))
+                atContains("+CEREG: 0,5") ||
+                atContains("+CEREG: 1,1") ||
+                atContains("+CEREG: 1,5"))
             {
-                Serial.println(F("[NB-IoT] Inregistrat in retea!"));
-                Serial.println(F("[NB-IoT] Verific nivel semnal cu AT+CSQ..."));
-
+                Serial.println(F("[NB] network OK"));
                 s_network_ready = true;
 
                 s_initState = INIT_CSQ;
                 s_initStepMs = now;
                 s_initStepTimeout = 5000;
                 s_stepRetries = 0;
-
                 atWrite(F("AT+CSQ"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_ceregRetries++;
-
                 if (s_ceregRetries >= 12) {
-                    Serial.println(F("[NB-IoT] EROARE: retea indisponibila / no coverage"));
+                    Serial.println(F("[NB] no network"));
                     printRawIfAny();
                     s_initState = INIT_FAILED;
                 } else {
-                    Serial.print(F("[NB-IoT] Reincercare CEREG "));
-                    Serial.print(s_ceregRetries);
-                    Serial.println(F("/12..."));
-
                     s_initStepMs = now;
                     atWrite(F("AT+CEREG?"));
                 }
             }
             break;
 
-
         case INIT_CSQ:
             if (atReadCheck("OK")) {
                 int rssi = parseCsqRssi();
-
-                Serial.print(F("[NB-IoT] CSQ RSSI = "));
+                Serial.print(F("[NB] CSQ="));
                 Serial.println(rssi);
 
                 if (rssi == 99 || rssi < 5) {
-                    Serial.println(F("[NB-IoT] Semnal slab sau necunoscut. Reincerc CSQ..."));
-
                     s_stepRetries++;
-
                     if (s_stepRetries >= 5) {
-                        Serial.println(F("[NB-IoT] EROARE: semnal insuficient pentru MQTT"));
+                        Serial.println(F("[NB] weak signal"));
                         s_initState = INIT_FAILED;
                     } else {
                         s_initStepMs = now;
                         atWrite(F("AT+CSQ"));
                     }
                 } else {
-                    Serial.println(F("[NB-IoT] Semnal OK. Pregatesc MQTT 3.1.1..."));
-
-                    delay(300);
-
                     s_initState = INIT_MQTT_VERSION;
                     s_initStepMs = now;
                     s_initStepTimeout = 5000;
                     s_stepRetries = 0;
-
                     atWrite(F("AT+QMTCFG=\"version\",0,1"));
                 }
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-
                 if (s_stepRetries >= 5) {
-                    Serial.println(F("[NB-IoT] EROARE: AT+CSQ fara raspuns"));
+                    Serial.println(F("[NB] CSQ fail"));
                     printRawIfAny();
                     s_initState = INIT_FAILED;
                 } else {
@@ -645,24 +491,19 @@ void nbiot_initTick() {
             }
             break;
 
-
         case INIT_MQTT_VERSION:
             if (atReadCheck("OK")) {
-                Serial.println(F("[NB-IoT] MQTT version setat la 3.1.1"));
-
+                Serial.println(F("[NB] MQTT 3.1.1"));
                 s_initState = INIT_MQTT_SSL;
                 s_initStepMs = now;
                 s_initStepTimeout = 5000;
                 s_stepRetries = 0;
-
                 atWrite(F("AT+QMTCFG=\"ssl\",0,1,1,0"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-
                 if (s_stepRetries >= 3) {
-                    Serial.println(F("[NB-IoT] EROARE: setare MQTT version esuata"));
                     printRawIfAny();
-                    beginFullMqttReconnect(F("QMTCFG version failed"));
+                    beginFullMqttReconnect(F("version"));
                 } else {
                     s_initStepMs = now;
                     atWrite(F("AT+QMTCFG=\"version\",0,1"));
@@ -670,25 +511,19 @@ void nbiot_initTick() {
             }
             break;
 
-
         case INIT_MQTT_SSL:
             if (atReadCheck("OK")) {
-                Serial.println(F("[NB-IoT] SSL/TLS activat pentru MQTT 8883."));
-                Serial.println(F("[NB-IoT] Deschid socket MQTT..."));
-
+                Serial.println(F("[NB] SSL OK"));
                 s_initState = INIT_MQTOPEN;
                 s_initStepMs = now;
                 s_initStepTimeout = 30000;
                 s_stepRetries = 0;
-
                 sendQmtOpen();
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-
                 if (s_stepRetries >= 3) {
-                    Serial.println(F("[NB-IoT] EROARE: activare SSL/TLS MQTT esuata"));
                     printRawIfAny();
-                    beginFullMqttReconnect(F("QMTCFG ssl failed"));
+                    beginFullMqttReconnect(F("ssl"));
                 } else {
                     s_initStepMs = now;
                     atWrite(F("AT+QMTCFG=\"ssl\",0,1,1,0"));
@@ -696,279 +531,193 @@ void nbiot_initTick() {
             }
             break;
 
-
         case INIT_MQTOPEN:
             if (atReadCheck("+QMTOPEN: 0,0")) {
-                Serial.println(F("[NB-IoT] TCP/MQTTS conectat!"));
-                Serial.println(F("[NB-IoT] Autentificare MQTT..."));
-
+                Serial.println(F("[NB] QMTOPEN OK"));
                 s_initState = INIT_MQTCONN;
                 s_initStepMs = now;
                 s_initStepTimeout = 30000;
                 s_stepRetries = 0;
-
                 sendQmtConn();
-            }
-
-            // A primit +QMTOPEN dar cu alt cod decât 0
-            else if (strstr(s_atBuf, "+QMTOPEN: 0,")) {
-                Serial.println(F("[NB-IoT] EROARE QMTOPEN:"));
-                Serial.println(s_atBuf);
-
-                beginFullMqttReconnect(F("QMTOPEN result error"));
-            }
-
-            // ERROR / CME ERROR
-            else if (atHasError()) {
-                Serial.println(F("[NB-IoT] EROARE QMTOPEN:"));
-                Serial.println(s_atBuf);
-
-                beginFullMqttReconnect(F("QMTOPEN ERROR"));
-            }
-
-            // Timeout
-            else if (now - s_initStepMs > s_initStepTimeout) {
-                Serial.println(F("[NB-IoT] EROARE: QMTOPEN timeout."));
+            } else if ((atContains("+QMTOPEN: 0,") && !strstr(s_atBuf, "+QMTOPEN: 0,0")) || atHasError()) {
+                Serial.println(F("[NB] QMTOPEN fail"));
                 printRawIfAny();
-
+                beginFullMqttReconnect(F("QMTOPEN"));
+            } else if (now - s_initStepMs > s_initStepTimeout) {
+                Serial.println(F("[NB] QMTOPEN timeout"));
+                printRawIfAny();
                 beginFullMqttReconnect(F("QMTOPEN timeout"));
             }
             break;
 
-
         case INIT_MQTCONN:
             if (atReadCheck("+QMTCONN: 0,0,0")) {
-                Serial.println(F("[NB-IoT] Autentificat pe Live Objects!"));
-                Serial.println(F("[NB-IoT] Abonare la topic comenzi..."));
-
+                Serial.println(F("[NB] MQTT auth OK"));
                 s_initState = INIT_MQTSUB;
                 s_initStepMs = now;
                 s_initStepTimeout = 10000;
                 s_stepRetries = 0;
-
                 sendQmtSub();
-            } else if (atReadCheck("+QMTCONN: 0,0,4")) {
-                Serial.println(F("[NB-IoT] EROARE: username/parola gresite."));
-                beginFullMqttReconnect(F("QMTCONN bad credentials"));
-            } else if (atReadCheck("+QMTCONN: 0,0,5")) {
-                Serial.println(F("[NB-IoT] EROARE: not authorized. Verifica API key / DEVICE_ACCESS."));
-                beginFullMqttReconnect(F("QMTCONN not authorized"));
-            } else if (strstr(s_atBuf, "+QMTCONN: 0,")) {
-                Serial.println(F("[NB-IoT] EROARE QMTCONN:"));
-                Serial.println(s_atBuf);
-                beginFullMqttReconnect(F("QMTCONN result error"));
-            } else if (atHasError()) {
-                Serial.println(F("[NB-IoT] EROARE QMTCONN:"));
-                Serial.println(s_atBuf);
-                beginFullMqttReconnect(F("QMTCONN ERROR"));
+            } else if (atContains("+QMTCONN: 0,0,4") ||
+                       atContains("+QMTCONN: 0,0,5") ||
+                       atContains("+QMTCONN: 0,1") ||
+                       atContains("+QMTCONN: 0,2") ||
+                       atContains("+QMTCONN: 0,3") ||
+                       atContains("+QMTCONN: 0,4") ||
+                       atContains("+QMTCONN: 0,5") ||
+                       atHasError()) {
+                Serial.println(F("[NB] QMTCONN fail"));
+                printRawIfAny();
+                beginFullMqttReconnect(F("QMTCONN"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-
                 if (s_stepRetries >= 3) {
-                    Serial.println(F("[NB-IoT] EROARE: autentificare MQTT esuata dupa 3 incercari"));
+                    Serial.println(F("[NB] QMTCONN timeout"));
                     printRawIfAny();
                     beginFullMqttReconnect(F("QMTCONN timeout"));
                 } else {
-                    Serial.print(F("[NB-IoT] Reincercare MQTT auth "));
-                    Serial.print(s_stepRetries);
-                    Serial.println(F("/3..."));
-
                     s_initStepMs = now;
                     sendQmtConn();
                 }
             }
             break;
 
-
         case INIT_MQTSUB:
             if (atReadCheck("+QMTSUB:")) {
                 s_connected = true;
                 s_initState = INIT_DONE;
                 s_mqttReconnectAttempts = 0;
-
-                Serial.println(F("[NB-IoT] === ONLINE pe Live Objects MQTT! ==="));
-
-                Serial.print(F("[NB-IoT] Publish topic: "));
-                Serial.println(LO_TOPIC_PUB);
-
-                Serial.print(F("[NB-IoT] Subscribe topic: "));
-                Serial.println(LO_TOPIC_SUB);
-
+                Serial.println(F("[NB] ONLINE MQTT"));
                 nbiot_publish(EVT_SYSTEM_STATUS, "", "BOOT");
             } else if (atHasError()) {
-                Serial.println(F("[NB-IoT] EROARE QMTSUB:"));
-                Serial.println(s_atBuf);
-
-                beginFullMqttReconnect(F("QMTSUB ERROR"));
+                Serial.println(F("[NB] QMTSUB fail"));
+                printRawIfAny();
+                beginFullMqttReconnect(F("QMTSUB"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-
                 if (s_stepRetries >= 3) {
-                    Serial.println(F("[NB-IoT] EROARE: abonare MQTT esuata dupa 3 incercari"));
+                    Serial.println(F("[NB] QMTSUB timeout"));
                     printRawIfAny();
                     beginFullMqttReconnect(F("QMTSUB timeout"));
                 } else {
-                    Serial.print(F("[NB-IoT] Reincercare MQTT subscribe "));
-                    Serial.print(s_stepRetries);
-                    Serial.println(F("/3..."));
-
                     s_initStepMs = now;
                     sendQmtSub();
                 }
             }
             break;
 
-
-        // ====================================================
-        //  Deconectare completă MQTT înainte de reconnect
-        // ====================================================
-
         case INIT_MQTT_UNSUB:
-            if (atReadCheck("+QMTUNS:") ||
-                atReadCheck("OK") ||
-                atHasError() ||
+            if (atReadCheck("+QMTUNS:") || atContains("OK") || atHasError() ||
                 now - s_initStepMs > s_initStepTimeout)
             {
-                Serial.println(F("[NB-IoT] MQTT unsubscribe terminat/ignorat."));
-                Serial.println(F("[NB-IoT] Deconectez sesiunea MQTT..."));
-
                 s_initState = INIT_MQTT_DISC;
                 s_initStepMs = now;
-                s_initStepTimeout = 3000;
-                s_stepRetries = 0;
-
+                s_initStepTimeout = 2500;
                 sendQmtDisc();
             }
             break;
 
-
         case INIT_MQTT_DISC:
-            if (atReadCheck("+QMTDISC:") ||
-                atReadCheck("OK") ||
-                atHasError() ||
+            if (atReadCheck("+QMTDISC:") || atContains("OK") || atHasError() ||
                 now - s_initStepMs > s_initStepTimeout)
             {
-                Serial.println(F("[NB-IoT] MQTT disconnect terminat/ignorat."));
-                Serial.println(F("[NB-IoT] Inchid socket-ul MQTT..."));
-
                 s_initState = INIT_MQTT_CLOSE;
                 s_initStepMs = now;
-                s_initStepTimeout = 5000;
-                s_stepRetries = 0;
-
+                s_initStepTimeout = 4000;
                 sendQmtClose();
             }
             break;
 
-
         case INIT_MQTT_CLOSE:
-            if (atReadCheck("+QMTCLOSE:") ||
-                atReadCheck("OK") ||
-                atHasError() ||
+            if (atReadCheck("+QMTCLOSE:") || atContains("OK") || atHasError() ||
                 now - s_initStepMs > s_initStepTimeout)
             {
-                Serial.println(F("[NB-IoT] MQTT socket inchis/ignorat."));
-                Serial.println(F("[NB-IoT] Cooldown 5 secunde inainte de reconectare..."));
-
+                Serial.println(F("[NB] reconnect cooldown"));
                 s_connected = false;
-
                 s_initState = INIT_RECONNECT_COOLDOWN;
                 s_initStepMs = now;
                 s_initStepTimeout = MQTT_RECONNECT_COOLDOWN_MS;
-                s_stepRetries = 0;
             }
             break;
 
-
         case INIT_RECONNECT_COOLDOWN:
             if (now - s_initStepMs >= MQTT_RECONNECT_COOLDOWN_MS) {
-                Serial.println(F("[NB-IoT] Reiau procesul complet de conectare..."));
+                Serial.println(F("[NB] reconnect start"));
 
                 s_connected = false;
                 s_network_ready = false;
-
                 s_atRetries = 0;
                 s_stepRetries = 0;
                 s_ceregRetries = 0;
+                s_atPos = 0;
+                s_mqttPos = 0;
+                s_atBuf[0] = '\0';
+                s_mqttBuf[0] = '\0';
 
                 s_initState = INIT_AT_TEST;
                 s_initStepMs = now;
                 s_initStepTimeout = 5000;
-
                 atWrite("AT");
             }
             break;
-
 
         default:
             break;
     }
 }
 
-
-// ============================================================
-//  Publicare MQTT / SMS fallback
-// ============================================================
-
 void nbiot_publish(const char* eventType,
                    const char* uid,
                    const char* stateStr)
 {
     if (s_initState != INIT_DONE && s_initState != INIT_FAILED) {
-        Serial.print(F("[NB-IoT] Init in curs, eveniment ignorat: "));
+        Serial.print(F("[NB] init, drop "));
         Serial.println(eventType);
         return;
     }
 
     if (s_connected) {
-        char payload[150];
+        char payload[PAYLOAD_BUF_SIZE];
 
-        snprintf(payload, sizeof(payload),
-                 "{\"device_id\":\"%s\",\"event\":\"%s\",\"uid\":\"%s\",\"state\":\"%s\"}",
-                 LO_DEVICE_ID,
-                 eventType ? eventType : "",
-                 uid ? uid : "",
-                 stateStr ? stateStr : "");
+        int written = snprintf(payload, sizeof(payload),
+                               "{\"d\":\"%s\",\"e\":\"%s\",\"u\":\"%s\",\"s\":\"%s\"}",
+                               LO_DEVICE_ID,
+                               eventType ? eventType : "",
+                               uid ? uid : "",
+                               stateStr ? stateStr : "");
 
-        int len = strlen(payload);
+        if (written <= 0 || written >= (int)sizeof(payload)) {
+            Serial.println(F("[MQTT] payload too big"));
+            return;
+        }
 
         clearAtBuffer();
 
         s_modem.print(F("AT+QMTPUB=0,0,0,0,\""));
         s_modem.print(LO_TOPIC_PUB);
         s_modem.print(F("\","));
-        s_modem.println(len);
+        s_modem.println(written);
 
-        Serial.print(F("[AT>>] AT+QMTPUB=0,0,0,0,\""));
-        Serial.print(LO_TOPIC_PUB);
-        Serial.print(F("\","));
-        Serial.println(len);
+        Serial.print(F("[AT>>] PUB len="));
+        Serial.println(written);
 
-        bool gotPrompt = waitPrompt(5000);
-
-        if (!gotPrompt) {
-            Serial.println(F("[MQTT] EROARE: nu am primit prompt > pentru payload"));
-            smsSend(eventType, uid, stateStr);
+        if (!waitPrompt(5000)) {
+            Serial.println(F("[MQTT] no prompt"));
+            beginFullMqttReconnect(F("PUB no prompt"));
             return;
         }
 
-        delay(100);
-
+        delay(80);
         s_modem.print(payload);
 
-        Serial.print(F("[MQTT] Payload: "));
-        Serial.println(payload);
-
-        char buf[140];
+        char buf[72];
         byte pos = 0;
-        memset(buf, 0, sizeof(buf));
+        buf[0] = '\0';
 
         unsigned long start = millis();
-
         while (millis() - start < 10000) {
             while (s_modem.available() && pos < sizeof(buf) - 1) {
                 char c = s_modem.read();
-
                 if (c == '\r') continue;
 
                 buf[pos++] = c;
@@ -976,37 +725,26 @@ void nbiot_publish(const char* eventType,
             }
 
             if (strstr(buf, "+QMTPUB: 0,0,0")) {
-                Serial.println(F("[MQTT] Publicat cu succes!"));
+                Serial.println(F("[MQTT] PUB OK"));
                 return;
             }
 
             if (strstr(buf, "+QMTPUB:")) {
-                Serial.print(F("[MQTT] Raspuns publish: "));
+                Serial.print(F("[MQTT] PUB resp "));
                 Serial.println(buf);
                 return;
             }
 
-            if (strstr(buf, "ERROR") ||
-                strstr(buf, "+CME ERROR") ||
-                strstr(buf, "+CMS ERROR"))
-            {
-                Serial.print(F("[MQTT] ERROR publish: "));
+            if (strstr(buf, "ERROR")) {
+                Serial.print(F("[MQTT] PUB err "));
                 Serial.println(buf);
-
-                s_connected = false;
-                beginFullMqttReconnect(F("QMTPUB ERROR"));
-
-                smsSend(eventType, uid, stateStr);
+                beginFullMqttReconnect(F("PUB error"));
                 return;
             }
         }
 
-        Serial.println(F("[MQTT] Timeout publish"));
-
-        s_connected = false;
-        beginFullMqttReconnect(F("QMTPUB timeout"));
-
-        smsSend(eventType, uid, stateStr);
+        Serial.println(F("[MQTT] PUB timeout"));
+        beginFullMqttReconnect(F("PUB timeout"));
         return;
     }
 
@@ -1017,66 +755,47 @@ void nbiot_publish(const char* eventType,
         strcmp(eventType, EVT_SYSTEM_STATUS) == 0;
 
     if (!sendSms) {
-        Serial.print(F("[NB-IoT] Offline, ignorat: "));
+        Serial.print(F("[NB] offline drop "));
         Serial.println(eventType);
         return;
     }
 
     if (!s_network_ready) {
-        Serial.println(F("[SMS] Retea indisponibila, SMS imposibil"));
+        Serial.println(F("[SMS] no network"));
         return;
     }
 
     smsSend(eventType, uid, stateStr);
 }
 
-
-// ============================================================
-//  Parsare JSON comenzi
-// ============================================================
-
 static bool parseJsonField(const char* json,
                            const char* field,
                            char* out,
                            byte outSize)
 {
-    char needle[24];
-
+    char needle[18];
     snprintf(needle, sizeof(needle), "\"%s\":\"", field);
 
     const char* start = strstr(json, needle);
-
     if (!start) return false;
 
     start += strlen(needle);
-
     const char* end = strchr(start, '"');
-
     if (!end) return false;
 
     byte len = (byte)(end - start);
-
-    if (len >= outSize) {
-        len = outSize - 1;
-    }
+    if (len >= outSize) len = outSize - 1;
 
     strncpy(out, start, len);
     out[len] = '\0';
-
     return true;
 }
-
-
-// ============================================================
-//  Comenzi primite MQTT
-// ============================================================
 
 void nbiot_checkCommands() {
     if (!s_connected || !s_cmdCallback) return;
 
     while (s_modem.available() && s_mqttPos < sizeof(s_mqttBuf) - 1) {
         char c = s_modem.read();
-
         if (c == '\r') continue;
 
         s_mqttBuf[s_mqttPos++] = c;
@@ -1086,35 +805,28 @@ void nbiot_checkCommands() {
     if (!strstr(s_mqttBuf, "+QMTRECV:")) return;
     if (!strchr(s_mqttBuf, '\n')) return;
 
-    Serial.print(F("[MQTT] Comanda primita: "));
+    Serial.print(F("[MQTT] cmd "));
     Serial.println(s_mqttBuf);
 
     const char* jsonStart = strchr(s_mqttBuf, '{');
-
     if (!jsonStart) {
         s_mqttPos = 0;
-        memset(s_mqttBuf, 0, sizeof(s_mqttBuf));
+        s_mqttBuf[0] = '\0';
         return;
     }
 
-    char jsonBuf[140];
+    char jsonBuf[88];
     strncpy(jsonBuf, jsonStart, sizeof(jsonBuf) - 1);
     jsonBuf[sizeof(jsonBuf) - 1] = '\0';
 
     s_mqttPos = 0;
-    memset(s_mqttBuf, 0, sizeof(s_mqttBuf));
+    s_mqttBuf[0] = '\0';
 
     char* jsonEnd = strchr(jsonBuf, '}');
+    if (jsonEnd) *(jsonEnd + 1) = '\0';
 
-    if (jsonEnd) {
-        *(jsonEnd + 1) = '\0';
-    }
-
-    char cmdStr[18];
-
-    if (!parseJsonField(jsonBuf, "cmd", cmdStr, sizeof(cmdStr))) {
-        return;
-    }
+    char cmdStr[14];
+    if (!parseJsonField(jsonBuf, "cmd", cmdStr, sizeof(cmdStr))) return;
 
     NbiotCommand command;
     memset(&command, 0, sizeof(command));
@@ -1124,16 +836,10 @@ void nbiot_checkCommands() {
         command.type = CMD_OPEN;
     } else if (strcmp(cmdStr, "card_add") == 0) {
         command.type = CMD_CARD_ADD;
-
-        if (!parseJsonField(jsonBuf, "uid", command.uid, sizeof(command.uid))) {
-            return;
-        }
+        if (!parseJsonField(jsonBuf, "uid", command.uid, sizeof(command.uid))) return;
     } else if (strcmp(cmdStr, "card_remove") == 0) {
         command.type = CMD_CARD_REMOVE;
-
-        if (!parseJsonField(jsonBuf, "uid", command.uid, sizeof(command.uid))) {
-            return;
-        }
+        if (!parseJsonField(jsonBuf, "uid", command.uid, sizeof(command.uid))) return;
     } else if (strcmp(cmdStr, "status") == 0) {
         command.type = CMD_STATUS;
     } else {
@@ -1143,11 +849,6 @@ void nbiot_checkCommands() {
     s_cmdCallback(command);
 }
 
-
-// ============================================================
-//  Callback / heartbeat / status
-// ============================================================
-
 void nbiot_setCommandCallback(NbiotCommandCallback cb) {
     s_cmdCallback = cb;
 }
@@ -1156,7 +857,6 @@ void nbiot_heartbeatTick(const char* stateStr) {
     if (!s_connected) return;
 
     unsigned long now = millis();
-
     if (now - s_lastHeartbeatMs >= NBIOT_HEARTBEAT_MS) {
         s_lastHeartbeatMs = now;
         nbiot_publish(EVT_SYSTEM_STATUS, "", stateStr);
