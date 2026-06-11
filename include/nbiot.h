@@ -60,6 +60,6 @@ void nbiot_setCommandCallback(NbiotCommandCallback cb);
 void nbiot_heartbeatTick(const char* stateStr);
 bool nbiot_isConnected();
 
-#define NBIOT_HEARTBEAT_MS 30000UL
+#define NBIOT_HEARTBEAT_MS 120000UL
 
 #endif // NBIOT_H

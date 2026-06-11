@@ -116,24 +116,31 @@ static void enterState(State next) {
 }
 
 static bool queueEvent(EventCode code, const char* uid, State state) {
-    if (code == EV_NONE) return false;
+    if (code == EV_NONE) {
+        return false;
+    }
 
     if (g_qCount >= EVENT_QUEUE_SIZE) {
-        Serial.println(F("[Q] full"));
-        return false;
+        Serial.println(F("[Q] full, overwrite old"));
+
+        g_qHead = (g_qHead + 1) % EVENT_QUEUE_SIZE;
+        g_qCount--;
     }
 
     g_queue[g_qTail].code = code;
     g_queue[g_qTail].state = state;
 
-    strncpy(g_queue[g_qTail].uid, uid ? uid : "", sizeof(g_queue[g_qTail].uid) - 1);
+    strncpy(g_queue[g_qTail].uid,
+            uid ? uid : "",
+            sizeof(g_queue[g_qTail].uid) - 1);
+
     g_queue[g_qTail].uid[sizeof(g_queue[g_qTail].uid) - 1] = '\0';
 
     g_qTail = (g_qTail + 1) % EVENT_QUEUE_SIZE;
     g_qCount++;
+
     return true;
 }
-
 static bool popEvent(PendingEvent* out) {
     if (g_qCount == 0 || !out) return false;
 

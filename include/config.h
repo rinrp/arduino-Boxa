@@ -35,6 +35,8 @@
 //  UID card autorizat (4 bytes, ex: CA:FD:A1:80)
 #define UID_VALID_LENGTH    4
 const byte UID_VALID[UID_VALID_LENGTH] = {0xCA, 0xFD, 0xA1, 0x80};
+
+#define ENABLE_DEFAULT_CARD 1 // daca EEPROM e gol cardul va fi adugat automat
   
 //  Timing state machine (milisecunde)
 // ACCESS_GRANTED: delay între LED verde și activarea yălii (LED albastru)
