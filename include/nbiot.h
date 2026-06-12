@@ -5,7 +5,7 @@
 
 // ============================================================
 //  nbiot.h — Quectel BC92 + Orange Live Objects
-//  BUILD: MQTT_RX_NONBLOCKING_NO_LOSS
+//  BUILD: MQTT_RX_PARSE_UID_AND_PUBLISH_OK
 // ============================================================
 
 #define LO_API_KEY       "4d248462f24c4f8d9a865c42019671bc"
@@ -22,7 +22,7 @@
 #define LO_TOPIC_SUB     "dev/cmd"
 #define LO_TOPIC_CMD_RES "dev/cmd/res"
 
-// SMS fallback — seteaza 1 pentru activare
+// 0 = SMS dezactivat, 1 = SMS activ pentru evenimente critice
 #define ENABLE_SMS_FALLBACK 0
 #define LO_SMS_ADMIN_NR  "3523"
 
@@ -54,6 +54,7 @@ enum NbiotCmd : byte {
 struct NbiotCommand {
     NbiotCmd type;
     char uid[15];   // "CA:FD:A1:80\0"
+    char cid[18];   // cid Live Objects pastrat ca text, ca sa evitam overflow int
 };
 
 typedef void (*NbiotCommandCallback)(const NbiotCommand& cmd);
@@ -68,11 +69,9 @@ void nbiot_publish(const char* eventType,
                    const char* uid,
                    const char* stateStr);
 
-// Citeste din SoftwareSerial si proceseaza comenzi.
-// Apelati cat mai des in loop() — non-blocker.
 void nbiot_checkCommands();
-
 void nbiot_setCommandCallback(NbiotCommandCallback cb);
+void nbiot_heartbeatTick(const char* stateStr);
 bool nbiot_isConnected();
 
 #define NBIOT_HEARTBEAT_MS 120000UL

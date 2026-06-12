@@ -3,268 +3,385 @@
 #include <SoftwareSerial.h>
 
 // ============================================================
-//  nbiot.cpp — BC92 + Orange Live Objects
-//  BUILD: MQTT_RX_NONBLOCKING_NO_LOSS
+//  nbiot.cpp — Quectel BC92 + Orange Live Objects
+//  BUILD: MQTT_RX_PARSE_UID_AND_PUBLISH_OK
 //
-//  Probleme rezolvate față de versiunea anterioară:
-//
-//  1. atWrite() nu mai face flush pe SoftwareSerial.
-//     Anterior: while(s_modem.available()) s_modem.read();
-//     ștergea +QMTRECV sosit între comenzi AT.
-//     Acum: datele din modem sunt citite ÎNTOTDEAUNA prin
-//     modemRead() care le rutează: +QMTRECV → cmdBuf,
-//     restul → atBuf.
-//
-//  2. atSendBlocking() nu mai pierde +QMTRECV.
-//     Anterior: citea într-un buf local și arunca tot ce nu
-//     era răspunsul așteptat. Acum rulează prin modemRead().
-//
-//  3. Parser JSON dual-format:
-//     - Live Objects: {"req":"card_add","arg":{"uid":"..."}}
-//     - Legacy:       {"cmd":"card_add","uid":"..."}
-//
-//  4. Buffer de comenzi separat (CMD_BUF_SIZE bytes) care
-//     acumulează date fără să interfereze cu bufferul AT.
-//
-//  5. Nu folosim AT+QMTCFG="recv/mode" — BC92 răspunde ERROR.
-//     Modemul trimite +QMTRECV automat (URC mode implicit).
+//  Obiective:
+//  - pastreaza conectarea MQTT care functiona deja;
+//  - citeste modemul printr-o singura functie centrala;
+//  - nu sterge +QMTRECV in timpul comenzilor AT;
+//  - parseaza req + arg.uid din Live Objects;
+//  - publica JSON valid pe dev/v1/data/rawjson/version1.
 // ============================================================
 
 #define MODEM_BAUD 9600
+
+#define MQTT_RECONNECT_MAX_ATTEMPTS 5
+#define MQTT_RECONNECT_COOLDOWN_MS  5000UL
+
+#define AT_BUF_SIZE       120
+#define MODEM_LINE_SIZE   220
+#define CMD_JSON_SIZE     170
+#define PAYLOAD_BUF_SIZE  130
+
 static SoftwareSerial s_modem(MODEM_RX_PIN, MODEM_TX_PIN);
 
 // ============================================================
-//  Buffere separate: AT vs comenzi MQTT
-//
-//  Dimensiuni calculate pentru 2KB RAM Arduino Uno:
-//  - AT buf: 80 bytes  — răspunsuri AT standard (OK, +QMTPUB etc)
-//  - CMD buf: 110 bytes — +QMTRECV: 0,0,dev/cmd,{"req":...}
-//    Un mesaj Live Objects tipic: ~80-100 chars
+//  Init state machine
 // ============================================================
-#define AT_BUF_SIZE  80
-#define CMD_BUF_SIZE 110
 
-static char  s_atBuf[AT_BUF_SIZE];
-static byte  s_atPos = 0;
-
-static char  s_cmdBuf[CMD_BUF_SIZE];
-static byte  s_cmdPos = 0;
-static bool  s_cmdReady = false;   // true cand avem o linie completa
-
-// ============================================================
-//  State machine initializare
-// ============================================================
 enum InitState : byte {
     INIT_IDLE,
     INIT_AT_TEST,
     INIT_ECHO_OFF,
     INIT_APN,
     INIT_CEREG,
-    INIT_MQTVER,     // AT+QMTCFG="version",0,1
-    INIT_MQTSSL,     // AT+QMTCFG="ssl",0,1,1,0
-    INIT_MQTOPEN,    // AT+QMTOPEN
-    INIT_MQTCONN,    // AT+QMTCONN
-    INIT_MQTSUB,     // AT+QMTSUB
+    INIT_CSQ,
+    INIT_MQTT_VERSION,
+    INIT_MQTT_SSL,
+    INIT_MQTOPEN,
+    INIT_MQTCONN,
+    INIT_MQTSUB,
+    INIT_MQTT_DISC,
+    INIT_MQTT_CLOSE,
+    INIT_RECONNECT_COOLDOWN,
     INIT_DONE,
     INIT_FAILED
 };
 
-static InitState     s_initState       = INIT_IDLE;
-static unsigned long s_initStepMs      = 0;
+static InitState s_initState = INIT_IDLE;
+static unsigned long s_initStepMs = 0;
 static unsigned long s_initStepTimeout = 0;
-static byte          s_ceregRetries    = 0;
-static byte          s_atRetries       = 0;
-static byte          s_stepRetries     = 0;
+static byte s_atRetries = 0;
+static byte s_stepRetries = 0;
+static byte s_ceregRetries = 0;
+static byte s_mqttReconnectAttempts = 0;
 
-static bool                  s_connected   = false;
-static bool                  s_netReady    = false;
-static NbiotCommandCallback  s_cmdCb       = nullptr;
-static unsigned long         s_lastHbMs    = 0;
+static bool s_connected = false;
+static bool s_networkReady = false;
+static unsigned long s_lastHeartbeatMs = 0;
+static NbiotCommandCallback s_cmdCallback = nullptr;
 
 // ============================================================
-//  modemRead() — SINGURA funcție care citește din SoftwareSerial
-//
-//  Rutează fiecare byte:
-//   - dacă linia curentă din cmdBuf conține "+QMTRECV" sau
-//     dacă cmdBuf e deja în curs de acumulare → cmdBuf
-//   - altfel → atBuf
-//
-//  Apelat din: atReadCheck(), atSendBlocking(), nbiot_checkCommands()
+//  Buffere RX separate
 // ============================================================
+
+static char s_atBuf[AT_BUF_SIZE];
+static byte s_atPos = 0;
+
+static char s_lineBuf[MODEM_LINE_SIZE];
+static byte s_linePos = 0;
+static bool s_promptSeen = false;
+
+static char s_cmdJson[CMD_JSON_SIZE];
+static bool s_cmdReady = false;
+
+// ============================================================
+//  Utilitare buffer
+// ============================================================
+
+static void resetAtBuffer() {
+    s_atPos = 0;
+    s_atBuf[0] = '\0';
+    s_promptSeen = false;
+}
+
+static void appendAtLine(const char* line) {
+    if (!line || !line[0]) return;
+
+    byte len = strlen(line);
+
+    if (len + s_atPos + 2 >= AT_BUF_SIZE) {
+        // Daca nu mai incape, pastram ultima linie AT.
+        s_atPos = 0;
+        s_atBuf[0] = '\0';
+    }
+
+    while (*line && s_atPos < AT_BUF_SIZE - 2) {
+        s_atBuf[s_atPos++] = *line++;
+    }
+
+    if (s_atPos < AT_BUF_SIZE - 2) {
+        s_atBuf[s_atPos++] = '\n';
+    }
+
+    s_atBuf[s_atPos] = '\0';
+}
+
+static void finishLine() {
+    s_lineBuf[s_linePos] = '\0';
+
+    // Sterge \n final daca exista.
+    while (s_linePos > 0 &&
+           (s_lineBuf[s_linePos - 1] == '\n' || s_lineBuf[s_linePos - 1] == '\r')) {
+        s_lineBuf[--s_linePos] = '\0';
+    }
+
+    if (strstr(s_lineBuf, "+QMTRECV:")) {
+        const char* jsonStart = strchr(s_lineBuf, '{');
+        const char* jsonEnd = strrchr(s_lineBuf, '}');
+
+        if (jsonStart && jsonEnd && jsonEnd >= jsonStart) {
+            byte n = (byte)(jsonEnd - jsonStart + 1);
+            if (n >= CMD_JSON_SIZE) n = CMD_JSON_SIZE - 1;
+
+            memcpy(s_cmdJson, jsonStart, n);
+            s_cmdJson[n] = '\0';
+            s_cmdReady = true;
+        }
+    } else {
+        appendAtLine(s_lineBuf);
+    }
+
+    s_linePos = 0;
+    s_lineBuf[0] = '\0';
+}
+
+// ============================================================
+//  modemRead() — SINGURA functie care citeste din SoftwareSerial
+// ============================================================
+
 static void modemRead() {
     while (s_modem.available()) {
         char c = (char)s_modem.read();
 
-        // Decide rutarea: dacă cmdBuf are deja ceva sau
-        // dacă atBuf conține "+QMTRECV" la început
-        bool routeToCmd = (s_cmdPos > 0);
+        if (c == '\r') continue;
 
-        // Dacă cmdBuf e gol, verifica daca atBuf contine prefix QMTRECV
-        if (!routeToCmd && s_atPos >= 8) {
-            // Cauta "+QMTRECV" in atBuf
-            routeToCmd = (strstr(s_atBuf, "+QMTRECV") != nullptr);
-            if (routeToCmd) {
-                // Muta ce avem din atBuf in cmdBuf
-                byte move = s_atPos < CMD_BUF_SIZE - 1 ? s_atPos : CMD_BUF_SIZE - 2;
-                memcpy(s_cmdBuf, s_atBuf, move);
-                s_cmdPos = move;
-                s_cmdBuf[s_cmdPos] = '\0';
-                s_atPos = 0;
-                s_atBuf[0] = '\0';
-            }
+        if (c == '>') {
+            s_promptSeen = true;
+            continue;
         }
 
-        if (routeToCmd) {
-            if (s_cmdPos < CMD_BUF_SIZE - 1) {
-                s_cmdBuf[s_cmdPos++] = c;
-                s_cmdBuf[s_cmdPos]   = '\0';
-            }
-            // Linie completa?
-            if (c == '\n') {
-                s_cmdReady = true;
-            }
+        if (s_linePos < MODEM_LINE_SIZE - 1) {
+            s_lineBuf[s_linePos++] = c;
+            s_lineBuf[s_linePos] = '\0';
         } else {
-            // Verifica daca noul caracter ar face bufferul sa contina QMTRECV
-            if (s_atPos < AT_BUF_SIZE - 1) {
-                s_atBuf[s_atPos++] = c;
-                s_atBuf[s_atPos]   = '\0';
+            // Linie prea mare: pastram inceputul pentru debug si o finalizam.
+            finishLine();
+        }
 
-                // Re-verifica dupa adaugare
-                if (strstr(s_atBuf, "+QMTRECV") != nullptr) {
-                    // Muta in cmdBuf
-                    byte move = s_atPos < CMD_BUF_SIZE - 1 ? s_atPos : CMD_BUF_SIZE - 2;
-                    memcpy(s_cmdBuf, s_atBuf, move);
-                    s_cmdPos = move;
-                    s_cmdBuf[s_cmdPos] = '\0';
-                    s_atPos = 0;
-                    s_atBuf[0] = '\0';
-                }
-            }
-            if (c == '\n' && s_atPos > 0) {
-                // Linie AT completa — reset pozitie pentru urmatoarea linie
-                // dar pastreaza continutul pentru atReadCheck
-            }
+        if (c == '\n') {
+            finishLine();
         }
     }
 }
 
 // ============================================================
-//  atWrite() — trimite comanda AT fara sa stearga bufferele
-//  NU mai face flush pe SoftwareSerial!
+//  AT helpers — fara flush din modem
 // ============================================================
-static void atWrite(const __FlashStringHelper* cmd) {
-    // Reset doar atBuf — nu cmdBuf!
-    s_atPos = 0;
-    s_atBuf[0] = '\0';
-
-    s_modem.println(cmd);
-    Serial.print(F("[AT>>] "));
-    Serial.println(cmd);
-}
 
 static void atWrite(const char* cmd) {
-    s_atPos = 0;
-    s_atBuf[0] = '\0';
-
+    resetAtBuffer();
     s_modem.println(cmd);
     Serial.print(F("[AT>>] "));
     Serial.println(cmd);
 }
 
-// ============================================================
-//  atReadCheck() — cauta subsirul in atBuf
-//  Apeleaza modemRead() pentru a umple bufferul.
-// ============================================================
-static bool atReadCheck(const char* expect) {
-    modemRead();
-    return (strstr(s_atBuf, expect) != nullptr);
+static void atWrite(const __FlashStringHelper* cmd) {
+    resetAtBuffer();
+    s_modem.println(cmd);
+    Serial.print(F("[AT>>] "));
+    Serial.println(cmd);
 }
 
-// ============================================================
-//  atSendBlocking() — blocker scurt DOAR pentru publish
-//  Apeleaza modemRead() — nu pierde +QMTRECV
-// ============================================================
-static bool atSendBlocking(const char* expect, unsigned int timeoutMs) {
-    s_atPos = 0;
-    s_atBuf[0] = '\0';
+static bool atReadCheck(const char* expect) {
+    modemRead();
+    return strstr(s_atBuf, expect) != nullptr;
+}
 
+static bool atContains(const char* text) {
+    modemRead();
+    return strstr(s_atBuf, text) != nullptr;
+}
+
+static bool atHasError() {
+    modemRead();
+    return strstr(s_atBuf, "ERROR") != nullptr ||
+           strstr(s_atBuf, "+CME ERROR") != nullptr ||
+           strstr(s_atBuf, "+CMS ERROR") != nullptr;
+}
+
+static bool waitForText(const char* expect, unsigned long timeoutMs) {
     unsigned long start = millis();
+
     while (millis() - start < timeoutMs) {
         modemRead();
+
         if (strstr(s_atBuf, expect)) {
-            Serial.print(F("[AT<<] "));
-            Serial.println(s_atBuf);
             return true;
         }
+
+        if (strstr(s_atBuf, "ERROR") ||
+            strstr(s_atBuf, "+CME ERROR") ||
+            strstr(s_atBuf, "+CMS ERROR")) {
+            return false;
+        }
     }
-    Serial.println(F("[AT] timeout"));
+
     return false;
 }
 
+static bool waitForPrompt(unsigned long timeoutMs) {
+    unsigned long start = millis();
+
+    while (millis() - start < timeoutMs) {
+        modemRead();
+        if (s_promptSeen) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void printRawIfAny() {
+    modemRead();
+    if (s_atPos > 0) {
+        Serial.print(F("[AT RAW] "));
+        Serial.println(s_atBuf);
+    }
+}
+
+static int parseCsqRssi() {
+    modemRead();
+    const char* p = strstr(s_atBuf, "+CSQ:");
+    if (!p) return -1;
+
+    p += 5;
+    while (*p == ' ') p++;
+    return atoi(p);
+}
+
 // ============================================================
-//  nbiot_init()
+//  MQTT connect helpers
 // ============================================================
+
+static void sendQmtOpen() {
+    resetAtBuffer();
+
+    s_modem.print(F("AT+QMTOPEN=0,\""));
+    s_modem.print(LO_MQTT_HOST);
+    s_modem.print(F("\","));
+    s_modem.print(LO_MQTT_PORT);
+    s_modem.println();
+
+    Serial.print(F("[AT>>] QMTOPEN "));
+    Serial.println(LO_MQTT_HOST);
+}
+
+static void sendQmtConn() {
+    resetAtBuffer();
+
+    s_modem.print(F("AT+QMTCONN=0,\""));
+    s_modem.print(LO_MQTT_CLIENT);
+    s_modem.print(F("\",\""));
+    s_modem.print(LO_MQTT_USER);
+    s_modem.print(F("\",\""));
+    s_modem.print(LO_API_KEY);
+    s_modem.println(F("\""));
+
+    Serial.println(F("[AT>>] QMTCONN ***"));
+}
+
+static void sendQmtSub() {
+    resetAtBuffer();
+
+    s_modem.print(F("AT+QMTSUB=0,1,\""));
+    s_modem.print(LO_TOPIC_SUB);
+    s_modem.println(F("\",1"));
+
+    Serial.print(F("[AT>>] QMTSUB "));
+    Serial.println(LO_TOPIC_SUB);
+}
+
+static void sendQmtDisc() {
+    resetAtBuffer();
+    s_modem.println(F("AT+QMTDISC=0"));
+    Serial.println(F("[AT>>] QMTDISC"));
+}
+
+static void sendQmtClose() {
+    resetAtBuffer();
+    s_modem.println(F("AT+QMTCLOSE=0"));
+    Serial.println(F("[AT>>] QMTCLOSE"));
+}
+
+static void beginReconnect(const __FlashStringHelper* reason) {
+    Serial.print(F("[NB] Reconnect: "));
+    Serial.println(reason);
+
+    s_connected = false;
+
+    if (s_mqttReconnectAttempts >= MQTT_RECONNECT_MAX_ATTEMPTS) {
+        Serial.println(F("[NB] reconnect esuat dupa 5 incercari"));
+        s_initState = INIT_FAILED;
+        return;
+    }
+
+    s_mqttReconnectAttempts++;
+    s_initState = INIT_MQTT_DISC;
+    s_initStepMs = millis();
+    s_initStepTimeout = 3000;
+    sendQmtDisc();
+}
+
+// ============================================================
+//  Init
+// ============================================================
+
 bool nbiot_init() {
     s_modem.begin(MODEM_BAUD);
     delay(500);
 
-    Serial.println(F("[BUILD] MQTT_RX_NONBLOCKING_NO_LOSS"));
-    Serial.println(F("[NB-IoT] Init non-blocker..."));
-    Serial.println(F("[NB-IoT] RFID/senzori activi imediat."));
+    resetAtBuffer();
+    s_linePos = 0;
+    s_lineBuf[0] = '\0';
+    s_cmdJson[0] = '\0';
+    s_cmdReady = false;
 
-    s_initState       = INIT_AT_TEST;
-    s_initStepMs      = millis();
+    s_connected = false;
+    s_networkReady = false;
+    s_atRetries = 0;
+    s_stepRetries = 0;
+    s_ceregRetries = 0;
+    s_mqttReconnectAttempts = 0;
+    s_lastHeartbeatMs = 0;
+
+    Serial.println(F("[BUILD] MQTT_RX_PARSE_UID_AND_PUBLISH_OK"));
+    Serial.println(F("[NB-IoT] Init non-blocker..."));
+
+    s_initState = INIT_AT_TEST;
+    s_initStepMs = millis();
     s_initStepTimeout = 5000;
-    s_atRetries       = 0;
-    s_ceregRetries    = 0;
-    s_stepRetries     = 0;
 
     atWrite("AT");
     return true;
 }
 
-// ============================================================
-//  nbiot_initTick() — state machine initializare
-//
-//  Secventa AT commands (pastrata identica cu ce functioneaza):
-//  1. AT
-//  2. ATE0
-//  3. AT+QCGDEFCONT="IP","net"
-//  4. AT+CEREG?
-//  5. AT+CSQ  (optional, doar log)
-//  6. AT+QMTCFG="version",0,1
-//  7. AT+QMTCFG="ssl",0,1,1,0
-//  8. AT+QMTOPEN=0,"liveobjects...",8883
-//  9. AT+QMTCONN=0,"RFID","json+device","<apikey>"
-// 10. AT+QMTSUB=0,1,"dev/cmd",1
-// ============================================================
 void nbiot_initTick() {
-    if (s_initState == INIT_DONE || s_initState == INIT_FAILED) return;
-    if (s_initState == INIT_IDLE) return;
+    modemRead();
 
-    modemRead();  // citeste constant fara sa piarda date
+    if (s_initState == INIT_IDLE || s_initState == INIT_DONE || s_initState == INIT_FAILED) {
+        return;
+    }
 
     unsigned long now = millis();
 
     switch (s_initState) {
-
         case INIT_AT_TEST:
-            if (strstr(s_atBuf, "OK")) {
+            if (atReadCheck("OK")) {
                 Serial.println(F("[NB-IoT] Modem OK"));
                 s_initState = INIT_ECHO_OFF;
                 s_initStepMs = now;
+                s_initStepTimeout = 3000;
                 s_stepRetries = 0;
-                atWrite("ATE0");
+                atWrite(F("ATE0"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_atRetries++;
                 if (s_atRetries >= 5) {
-                    Serial.println(F("[NB-IoT] EROARE: modem nu raspunde"));
-                    Serial.println(F("[NB-IoT] Verifica: D2->BC92_RX, D3->BC92_TX"));
-                    Serial.println(F("[NB-IoT] Sistem LOCAL activ."));
+                    Serial.println(F("[NB-IoT] modem nu raspunde"));
                     s_initState = INIT_FAILED;
                 } else {
-                    Serial.print(F("[NB-IoT] Retry AT "));
-                    Serial.println(s_atRetries);
                     s_initStepMs = now;
                     atWrite("AT");
                 }
@@ -272,24 +389,28 @@ void nbiot_initTick() {
             break;
 
         case INIT_ECHO_OFF:
-            if (strstr(s_atBuf, "OK")) {
+            if (atReadCheck("OK")) {
                 Serial.println(F("[NB-IoT] Echo off"));
                 s_initState = INIT_APN;
                 s_initStepMs = now;
                 s_initStepTimeout = 10000;
                 s_stepRetries = 0;
                 atWrite(F("AT+QCGDEFCONT=\"IP\",\"net\""));
-            } else if (now - s_initStepMs > 3000) {
+            } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-                if (s_stepRetries >= 3) { s_initState = INIT_FAILED; return; }
-                s_initStepMs = now;
-                atWrite("ATE0");
+                if (s_stepRetries >= 3) {
+                    Serial.println(F("[NB-IoT] ATE0 fail"));
+                    printRawIfAny();
+                    s_initState = INIT_FAILED;
+                } else {
+                    s_initStepMs = now;
+                    atWrite(F("ATE0"));
+                }
             }
             break;
 
         case INIT_APN:
-            if (strstr(s_atBuf, "OK")) {
-                s_netReady = true;
+            if (atReadCheck("OK")) {
                 Serial.println(F("[NB-IoT] APN OK"));
                 s_initState = INIT_CEREG;
                 s_initStepMs = now;
@@ -298,33 +419,32 @@ void nbiot_initTick() {
                 atWrite(F("AT+CEREG?"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-                if (s_stepRetries >= 3) { s_initState = INIT_FAILED; return; }
-                Serial.print(F("[NB-IoT] Retry APN "));
-                Serial.println(s_stepRetries);
-                s_initStepMs = now;
-                atWrite(F("AT+QCGDEFCONT=\"IP\",\"net\""));
+                if (s_stepRetries >= 3) {
+                    Serial.println(F("[NB-IoT] APN fail"));
+                    printRawIfAny();
+                    s_initState = INIT_FAILED;
+                } else {
+                    s_initStepMs = now;
+                    atWrite(F("AT+QCGDEFCONT=\"IP\",\"net\""));
+                }
             }
             break;
 
         case INIT_CEREG:
-            if (strstr(s_atBuf, "+CEREG: 0,1") || strstr(s_atBuf, "+CEREG: 0,5")) {
+            if (atContains("+CEREG: 0,1") || atContains("+CEREG: 0,5") ||
+                atContains("+CEREG: 1,1") || atContains("+CEREG: 1,5")) {
                 Serial.println(F("[NB-IoT] Retea OK"));
-                // Log semnal
-                s_modem.println(F("AT+CSQ"));
-                delay(200);
-                modemRead();
-                Serial.print(F("[NB-IoT] CSQ: "));
-                Serial.println(s_atBuf);
-
-                s_initState = INIT_MQTVER;
+                s_networkReady = true;
+                s_initState = INIT_CSQ;
                 s_initStepMs = now;
                 s_initStepTimeout = 5000;
                 s_stepRetries = 0;
-                atWrite(F("AT+QMTCFG=\"version\",0,1"));
+                atWrite(F("AT+CSQ"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_ceregRetries++;
                 if (s_ceregRetries >= 12) {
-                    Serial.println(F("[NB-IoT] EROARE: fara retea"));
+                    Serial.println(F("[NB-IoT] fara retea"));
+                    printRawIfAny();
                     s_initState = INIT_FAILED;
                 } else {
                     s_initStepMs = now;
@@ -333,148 +453,177 @@ void nbiot_initTick() {
             }
             break;
 
-        case INIT_MQTVER:
-            if (strstr(s_atBuf, "OK")) {
-                Serial.println(F("[NB-IoT] MQTT v3.1.1 OK"));
-                s_initState = INIT_MQTSSL;
+        case INIT_CSQ:
+            if (atReadCheck("OK")) {
+                Serial.print(F("[NB-IoT] CSQ="));
+                Serial.println(parseCsqRssi());
+                s_initState = INIT_MQTT_VERSION;
                 s_initStepMs = now;
+                s_initStepTimeout = 5000;
+                s_stepRetries = 0;
+                atWrite(F("AT+QMTCFG=\"version\",0,1"));
+            } else if (now - s_initStepMs > s_initStepTimeout) {
+                s_stepRetries++;
+                if (s_stepRetries >= 5) {
+                    Serial.println(F("[NB-IoT] CSQ timeout"));
+                    printRawIfAny();
+                    s_initState = INIT_FAILED;
+                } else {
+                    s_initStepMs = now;
+                    atWrite(F("AT+CSQ"));
+                }
+            }
+            break;
+
+        case INIT_MQTT_VERSION:
+            if (atReadCheck("OK")) {
+                Serial.println(F("[NB-IoT] MQTT v3.1.1 OK"));
+                s_initState = INIT_MQTT_SSL;
+                s_initStepMs = now;
+                s_initStepTimeout = 5000;
                 s_stepRetries = 0;
                 atWrite(F("AT+QMTCFG=\"ssl\",0,1,1,0"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-                if (s_stepRetries >= 3) { s_initState = INIT_FAILED; return; }
-                s_initStepMs = now;
-                atWrite(F("AT+QMTCFG=\"version\",0,1"));
+                if (s_stepRetries >= 3) {
+                    Serial.println(F("[NB-IoT] MQTT version fail"));
+                    printRawIfAny();
+                    beginReconnect(F("version"));
+                } else {
+                    s_initStepMs = now;
+                    atWrite(F("AT+QMTCFG=\"version\",0,1"));
+                }
             }
             break;
 
-        case INIT_MQTSSL:
-            if (strstr(s_atBuf, "OK")) {
+        case INIT_MQTT_SSL:
+            if (atReadCheck("OK")) {
                 Serial.println(F("[NB-IoT] SSL OK"));
                 s_initState = INIT_MQTOPEN;
                 s_initStepMs = now;
-                s_initStepTimeout = 20000;
+                s_initStepTimeout = 30000;
                 s_stepRetries = 0;
-
-                // AT+QMTOPEN fragmentat — economie RAM
-                Serial.print(F("[AT>>] AT+QMTOPEN=0,\""));
-                Serial.print(F(LO_MQTT_HOST));
-                Serial.print(F("\","));
-                Serial.println(LO_MQTT_PORT);
-
-                s_modem.print(F("AT+QMTOPEN=0,\""));
-                s_modem.print(F(LO_MQTT_HOST));
-                s_modem.print(F("\","));
-                s_modem.print(LO_MQTT_PORT);
-                s_modem.println();
-
-                s_atPos = 0; s_atBuf[0] = '\0';
-            } else if (now - s_initStepMs > 5000) {
+                sendQmtOpen();
+            } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-                if (s_stepRetries >= 3) { s_initState = INIT_FAILED; return; }
-                s_initStepMs = now;
-                atWrite(F("AT+QMTCFG=\"ssl\",0,1,1,0"));
+                if (s_stepRetries >= 3) {
+                    Serial.println(F("[NB-IoT] SSL fail"));
+                    printRawIfAny();
+                    beginReconnect(F("ssl"));
+                } else {
+                    s_initStepMs = now;
+                    atWrite(F("AT+QMTCFG=\"ssl\",0,1,1,0"));
+                }
             }
             break;
 
         case INIT_MQTOPEN:
-            if (strstr(s_atBuf, "+QMTOPEN: 0,0")) {
+            if (atContains("+QMTOPEN: 0,0")) {
                 Serial.println(F("[NB-IoT] Socket deschis!"));
                 s_initState = INIT_MQTCONN;
                 s_initStepMs = now;
-                s_initStepTimeout = 10000;
+                s_initStepTimeout = 30000;
                 s_stepRetries = 0;
-
-                Serial.println(F("[AT>>] AT+QMTCONN=0,RFID,json+device,***"));
-                s_modem.print(F("AT+QMTCONN=0,\""));
-                s_modem.print(F(LO_MQTT_CLIENT));
-                s_modem.print(F("\",\""));
-                s_modem.print(F(LO_MQTT_USER));
-                s_modem.print(F("\",\""));
-                s_modem.print(F(LO_API_KEY));
-                s_modem.println(F("\""));
-
-                s_atPos = 0; s_atBuf[0] = '\0';
-
-            } else if (strstr(s_atBuf, "+QMTOPEN: 0,-1")) {
-                Serial.println(F("[NB-IoT] EROARE socket — TLS?"));
-                s_initState = INIT_FAILED;
-
+                sendQmtConn();
+            } else if (atHasError() || atContains("+QMTOPEN: 0,")) {
+                if (!strstr(s_atBuf, "+QMTOPEN: 0,0")) {
+                    Serial.println(F("[NB-IoT] QMTOPEN fail"));
+                    printRawIfAny();
+                    beginReconnect(F("QMTOPEN"));
+                }
             } else if (now - s_initStepMs > s_initStepTimeout) {
-                s_stepRetries++;
-                if (s_stepRetries >= 3) { s_initState = INIT_FAILED; return; }
-                Serial.print(F("[NB-IoT] Retry QMTOPEN "));
-                Serial.println(s_stepRetries);
-                s_initStepMs = now;
-                s_atPos = 0; s_atBuf[0] = '\0';
-
-                s_modem.print(F("AT+QMTOPEN=0,\""));
-                s_modem.print(F(LO_MQTT_HOST));
-                s_modem.print(F("\","));
-                s_modem.print(LO_MQTT_PORT);
-                s_modem.println();
+                Serial.println(F("[NB-IoT] QMTOPEN timeout"));
+                printRawIfAny();
+                beginReconnect(F("QMTOPEN timeout"));
             }
             break;
 
         case INIT_MQTCONN:
-            if (strstr(s_atBuf, "+QMTCONN: 0,0,0")) {
+            if (atContains("+QMTCONN: 0,0,0")) {
                 Serial.println(F("[NB-IoT] Autentificat!"));
                 s_initState = INIT_MQTSUB;
                 s_initStepMs = now;
-                s_initStepTimeout = 5000;
+                s_initStepTimeout = 10000;
                 s_stepRetries = 0;
-
-                Serial.print(F("[AT>>] AT+QMTSUB=0,1,\""));
-                Serial.print(F(LO_TOPIC_SUB));
-                Serial.println(F("\",1"));
-
-                s_modem.print(F("AT+QMTSUB=0,1,\""));
-                s_modem.print(F(LO_TOPIC_SUB));
-                s_modem.println(F("\",1"));
-
-                s_atPos = 0; s_atBuf[0] = '\0';
-
-            } else if (strstr(s_atBuf, "+QMTCONN: 0,0,4") ||
-                       strstr(s_atBuf, "+QMTCONN: 0,0,5")) {
-                Serial.println(F("[NB-IoT] EROARE: credentiale invalide!"));
-                Serial.println(F("[NB-IoT] Verifica LO_API_KEY in nbiot.h"));
-                s_initState = INIT_FAILED;
-
+                sendQmtSub();
+            } else if (atContains("+QMTCONN: 0,0,4") || atContains("+QMTCONN: 0,0,5")) {
+                Serial.println(F("[NB-IoT] credentiale Live Objects invalide"));
+                beginReconnect(F("auth"));
+            } else if (atHasError()) {
+                Serial.println(F("[NB-IoT] QMTCONN error"));
+                printRawIfAny();
+                beginReconnect(F("QMTCONN"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-                if (s_stepRetries >= 3) { s_initState = INIT_FAILED; return; }
-                Serial.print(F("[NB-IoT] Retry QMTCONN "));
-                Serial.println(s_stepRetries);
-                s_initStepMs = now;
-                s_atPos = 0; s_atBuf[0] = '\0';
-
-                s_modem.print(F("AT+QMTCONN=0,\""));
-                s_modem.print(F(LO_MQTT_CLIENT));
-                s_modem.print(F("\",\""));
-                s_modem.print(F(LO_MQTT_USER));
-                s_modem.print(F("\",\""));
-                s_modem.print(F(LO_API_KEY));
-                s_modem.println(F("\""));
+                if (s_stepRetries >= 3) {
+                    Serial.println(F("[NB-IoT] QMTCONN timeout"));
+                    printRawIfAny();
+                    beginReconnect(F("QMTCONN timeout"));
+                } else {
+                    s_initStepMs = now;
+                    sendQmtConn();
+                }
             }
             break;
 
         case INIT_MQTSUB:
-            if (strstr(s_atBuf, "+QMTSUB:")) {
+            if (atContains("+QMTSUB:")) {
                 s_connected = true;
                 s_initState = INIT_DONE;
+                s_mqttReconnectAttempts = 0;
                 Serial.println(F("[NB-IoT] Subscris dev/cmd"));
                 Serial.println(F("[NB-IoT] === ONLINE ==="));
                 nbiot_publish(EVT_SYSTEM_STATUS, "", "BOOT");
-
+            } else if (atHasError()) {
+                Serial.println(F("[NB-IoT] QMTSUB error"));
+                printRawIfAny();
+                beginReconnect(F("QMTSUB"));
             } else if (now - s_initStepMs > s_initStepTimeout) {
                 s_stepRetries++;
-                if (s_stepRetries >= 3) { s_initState = INIT_FAILED; return; }
-                s_initStepMs = now;
-                s_atPos = 0; s_atBuf[0] = '\0';
+                if (s_stepRetries >= 3) {
+                    Serial.println(F("[NB-IoT] QMTSUB timeout"));
+                    printRawIfAny();
+                    beginReconnect(F("QMTSUB timeout"));
+                } else {
+                    s_initStepMs = now;
+                    sendQmtSub();
+                }
+            }
+            break;
 
-                s_modem.print(F("AT+QMTSUB=0,1,\""));
-                s_modem.print(F(LO_TOPIC_SUB));
-                s_modem.println(F("\",1"));
+        case INIT_MQTT_DISC:
+            if (atContains("+QMTDISC:") || atContains("OK") || atHasError() ||
+                now - s_initStepMs > s_initStepTimeout) {
+                s_initState = INIT_MQTT_CLOSE;
+                s_initStepMs = now;
+                s_initStepTimeout = 5000;
+                sendQmtClose();
+            }
+            break;
+
+        case INIT_MQTT_CLOSE:
+            if (atContains("+QMTCLOSE:") || atContains("OK") || atHasError() ||
+                now - s_initStepMs > s_initStepTimeout) {
+                Serial.println(F("[NB-IoT] reconnect cooldown"));
+                s_initState = INIT_RECONNECT_COOLDOWN;
+                s_initStepMs = now;
+                s_initStepTimeout = MQTT_RECONNECT_COOLDOWN_MS;
+            }
+            break;
+
+        case INIT_RECONNECT_COOLDOWN:
+            if (now - s_initStepMs >= s_initStepTimeout) {
+                Serial.println(F("[NB-IoT] reconnect start"));
+                s_connected = false;
+                s_networkReady = false;
+                s_atRetries = 0;
+                s_stepRetries = 0;
+                s_ceregRetries = 0;
+                resetAtBuffer();
+                s_initState = INIT_AT_TEST;
+                s_initStepMs = now;
+                s_initStepTimeout = 5000;
+                atWrite("AT");
             }
             break;
 
@@ -484,250 +633,251 @@ void nbiot_initTick() {
 }
 
 // ============================================================
-//  nbiot_publish() — MQTT publish fragmentat
-//
-//  Nu foloseste snprintf pentru payload — economie 200+ bytes.
-//  atSendBlocking() apeleaza modemRead() — nu pierde +QMTRECV.
+//  Publish MQTT
 // ============================================================
+
+static bool isCriticalEvent(const char* eventType) {
+    return strcmp(eventType, EVT_ALARM_START) == 0 ||
+           strcmp(eventType, EVT_ACCESS_DENIED) == 0 ||
+           strcmp(eventType, EVT_REMOTE_OPEN) == 0;
+}
+
+static void smsFallback(const char* eventType, const char* uid, const char* stateStr) {
+#if ENABLE_SMS_FALLBACK
+    if (!s_networkReady || !isCriticalEvent(eventType)) return;
+
+    Serial.print(F("[SMS] fallback "));
+    Serial.println(eventType);
+
+    // Simplu si limitat: SMS-ul ramane optional pentru a nu bloca testarea MQTT.
+    resetAtBuffer();
+    s_modem.println(F("AT+CMGF=1"));
+    waitForText("OK", 1500);
+
+    char cmd[28];
+    snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"", LO_SMS_ADMIN_NR);
+    resetAtBuffer();
+    s_modem.println(cmd);
+    if (waitForPrompt(4000)) {
+        s_modem.print(F("EVT:"));
+        s_modem.print(eventType);
+        s_modem.print(F(",ST:"));
+        s_modem.print(stateStr ? stateStr : "");
+        if (uid && uid[0]) {
+            s_modem.print(F(",UID:"));
+            s_modem.print(uid);
+        }
+        s_modem.write(26);
+        waitForText("OK", 8000);
+    }
+#else
+    (void)eventType;
+    (void)uid;
+    (void)stateStr;
+#endif
+}
+
 void nbiot_publish(const char* eventType,
                    const char* uid,
                    const char* stateStr) {
+    modemRead();
 
-    if (s_initState != INIT_DONE && s_initState != INIT_FAILED) {
+    if (s_initState != INIT_DONE) {
         Serial.print(F("[MQTT] Init in curs, ignorat: "));
-        Serial.println(eventType);
+        Serial.println(eventType ? eventType : "");
         return;
     }
 
     if (!s_connected) {
-#if ENABLE_SMS_FALLBACK
-        bool isCritic = (strcmp(eventType, EVT_ALARM_START)  == 0 ||
-                         strcmp(eventType, EVT_ACCESS_DENIED) == 0);
-        if (isCritic && s_netReady) {
-            // SMS fallback
-            s_modem.println(F("AT+CMGF=1"));
-            delay(200); modemRead();
-            char cmd[30];
-            snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"", LO_SMS_ADMIN_NR);
-            s_modem.println(cmd);
-            delay(300); modemRead();
-            s_modem.print(F("EVT:"));
-            s_modem.print(eventType);
-            s_modem.print(F(" ST:"));
-            s_modem.print(stateStr);
-            if (uid && uid[0]) { s_modem.print(F(" UID:")); s_modem.print(uid); }
-            s_modem.write(0x1A);
-            Serial.println(F("[SMS] trimis"));
-        }
-#else
-        Serial.print(F("[MQTT] Offline: "));
-        Serial.println(eventType);
-#endif
+        smsFallback(eventType, uid, stateStr);
         return;
     }
 
-    // Publish fragmentat — fara buffer intermediar
+    char payload[PAYLOAD_BUF_SIZE];
+    int written = snprintf(payload, sizeof(payload),
+                           "{\"s\":\"%s\",\"v\":{\"event\":\"%s\",\"uid\":\"%s\",\"state\":\"%s\"}}",
+                           LO_STREAM_ID,
+                           eventType ? eventType : "",
+                           uid ? uid : "",
+                           stateStr ? stateStr : "");
+
+    if (written <= 0 || written >= (int)sizeof(payload)) {
+        Serial.println(F("[MQTT PUB] payload prea mare"));
+        return;
+    }
+
+    Serial.print(F("[MQTT PUB] payload="));
+    Serial.println(payload);
+
+    resetAtBuffer();
+
     s_modem.print(F("AT+QMTPUB=0,1,0,0,\""));
-    s_modem.print(F(LO_TOPIC_PUB));
-    s_modem.print(F("\",\""));
-    // Payload JSON simplu — fara escape dublu (modemul BC92 accepta JSON direct)
-    s_modem.print(F("{\"s\":\""));
-    s_modem.print(F(LO_STREAM_ID));
-    s_modem.print(F("\",\"v\":{\"event\":\""));
-    s_modem.print(eventType);
-    s_modem.print(F("\",\"uid\":\""));
-    s_modem.print(uid ? uid : "");
-    s_modem.print(F("\",\"state\":\""));
-    s_modem.print(stateStr ? stateStr : "");
-    s_modem.println(F("\"}}\""));
+    s_modem.print(LO_TOPIC_PUB);
+    s_modem.print(F("\","));
+    s_modem.println(strlen(payload));
 
-    Serial.print(F("[MQTT] Pub: "));
-    Serial.println(eventType);
+    if (!waitForPrompt(4000)) {
+        Serial.println(F("[MQTT PUB] no prompt"));
+        smsFallback(eventType, uid, stateStr);
+        return;
+    }
 
-    // Asteapta +QMTPUB max 3s — modemRead() e apelat intern
-    atSendBlocking("+QMTPUB:", 3000);
+    resetAtBuffer();
+    s_modem.print(payload);
+
+    if (waitForText("+QMTPUB:", 7000)) {
+        Serial.println(F("[MQTT PUB] OK"));
+    } else {
+        Serial.println(F("[MQTT PUB] timeout"));
+        // Nu reconectam agresiv pentru evenimente minore.
+        smsFallback(eventType, uid, stateStr);
+    }
 }
 
 // ============================================================
-//  Parser JSON — suporta ambele formate:
-//
-//  Format Live Objects:
-//    {"req":"card_add","arg":{"uid":"CA:FD:A1:80"},"cid":123}
-//
-//  Format legacy (compatibilitate):
-//    {"cmd":"card_add","uid":"CA:FD:A1:80"}
-//
-//  Parsare minimala fara librarie — economie RAM.
-//  Cauta "cheie":"valoare" in sir.
+//  JSON parser fara ArduinoJson si fara String
 // ============================================================
 
-// Cauta valoarea unui camp string: "key":"value"
-// Returnează pointer la value (null-terminat pe loc) sau nullptr
-static char* findJsonStr(char* json, const char* key) {
-    // Construieste "key":
-    char needle[20];
-    byte klen = strlen(key);
-    if (klen + 4 >= sizeof(needle)) return nullptr;
-    needle[0] = '"';
-    memcpy(needle + 1, key, klen);
-    needle[klen + 1] = '"';
-    needle[klen + 2] = ':';
-    needle[klen + 3] = '"';
-    needle[klen + 4] = '\0';
-
-    char* p = strstr(json, needle);
-    if (!p) return nullptr;
-    p += klen + 4;  // sare peste "key":"
-
-    // Gaseste inchiderea "
-    char* end = strchr(p, '"');
-    if (!end) return nullptr;
-    *end = '\0';  // termina sirul pe loc
+static const char* skipSpaces(const char* p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     return p;
 }
 
-// Cauta valoarea unui camp nested: "arg":{"uid":"value"}
-// Returneaza pointer la value sau nullptr
-static char* findNestedStr(char* json, const char* outerKey, const char* innerKey) {
-    char needle[20];
-    byte klen = strlen(outerKey);
-    if (klen + 5 >= sizeof(needle)) return nullptr;
-    needle[0] = '"';
-    memcpy(needle + 1, outerKey, klen);
-    needle[klen + 1] = '"';
-    needle[klen + 2] = ':';
-    needle[klen + 3] = '{';
-    needle[klen + 4] = '\0';
+static bool jsonStringField(const char* json, const char* key, char* out, byte outSize) {
+    if (!json || !key || !out || outSize == 0) return false;
 
-    char* p = strstr(json, needle);
-    if (!p) return nullptr;
-    p += klen + 4;
+    char needle[18];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
 
-    // Gaseste inchiderea }
-    char* end = strchr(p, '}');
-    if (!end) return nullptr;
-    char saved = *end;
-    *end = '\0';
+    const char* p = strstr(json, needle);
+    if (!p) return false;
 
-    char* result = findJsonStr(p, innerKey);
-    *end = saved;  // restaureaza
-    return result;
+    p += strlen(needle);
+    p = skipSpaces(p);
+    if (*p != ':') return false;
+    p++;
+    p = skipSpaces(p);
+    if (*p != '"') return false;
+    p++;
+
+    byte i = 0;
+    while (*p && *p != '"' && i < outSize - 1) {
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+
+    return i > 0 && *p == '"';
 }
 
-static void processCommand(char* json) {
-    if (!s_cmdCb) return;
+static bool jsonCidField(const char* json, char* out, byte outSize) {
+    if (!json || !out || outSize == 0) return false;
 
-    Serial.print(F("[MQTT RX] raw="));
-    Serial.println(json);
+    const char* p = strstr(json, "\"cid\"");
+    if (!p) return false;
 
-    // Detecteaza formatul: Live Objects ("req") sau legacy ("cmd")
-    char* req = findJsonStr(json, "req");
-    if (!req) req = findJsonStr(json, "cmd");
-    if (!req) {
-        Serial.println(F("[CMD] nu gasesc req/cmd"));
+    p += 5;
+    p = skipSpaces(p);
+    if (*p != ':') return false;
+    p++;
+    p = skipSpaces(p);
+
+    byte i = 0;
+
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"' && i < outSize - 1) {
+            out[i++] = *p++;
+        }
+    } else {
+        while (*p && *p != ',' && *p != '}' && i < outSize - 1) {
+            if (*p != ' ') out[i++] = *p;
+            p++;
+        }
+    }
+
+    out[i] = '\0';
+    return i > 0;
+}
+
+// ============================================================
+//  Comenzi MQTT primite
+// ============================================================
+
+void nbiot_checkCommands() {
+    modemRead();
+
+    if (!s_cmdReady || !s_cmdCallback) {
         return;
     }
+
+    s_cmdReady = false;
+
+    Serial.print(F("[MQTT RX] raw="));
+    Serial.println(s_cmdJson);
+
+    NbiotCommand cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = CMD_NONE;
+
+    char req[16];
+    if (!jsonStringField(s_cmdJson, "req", req, sizeof(req))) {
+        if (!jsonStringField(s_cmdJson, "cmd", req, sizeof(req))) {
+            Serial.println(F("[CMD] lipseste req/cmd"));
+            return;
+        }
+    }
+
+    jsonCidField(s_cmdJson, cmd.cid, sizeof(cmd.cid));
 
     Serial.print(F("[CMD] req="));
     Serial.println(req);
 
-    NbiotCommand command;
-    memset(&command, 0, sizeof(command));
-
     if (strcmp(req, "open") == 0) {
-        command.type = CMD_OPEN;
-
+        cmd.type = CMD_OPEN;
+        Serial.println(F("[CMD] open"));
     } else if (strcmp(req, "status") == 0) {
-        command.type = CMD_STATUS;
-
+        cmd.type = CMD_STATUS;
+        Serial.println(F("[CMD] status"));
     } else if (strcmp(req, "card_add") == 0) {
-        command.type = CMD_CARD_ADD;
-
-        // Incearca Live Objects: arg.uid
-        char* uid = findNestedStr(json, "arg", "uid");
-        // Fallback legacy: uid direct
-        if (!uid) uid = findJsonStr(json, "uid");
-
-        if (!uid || uid[0] == '\0') {
+        cmd.type = CMD_CARD_ADD;
+        if (!jsonStringField(s_cmdJson, "uid", cmd.uid, sizeof(cmd.uid))) {
             Serial.println(F("[CMD] card_add: uid lipsa"));
             return;
         }
-        strncpy(command.uid, uid, sizeof(command.uid) - 1);
         Serial.print(F("[CMD] uid="));
-        Serial.println(command.uid);
-
+        Serial.println(cmd.uid);
     } else if (strcmp(req, "card_remove") == 0) {
-        command.type = CMD_CARD_REMOVE;
-
-        char* uid = findNestedStr(json, "arg", "uid");
-        if (!uid) uid = findJsonStr(json, "uid");
-
-        if (!uid || uid[0] == '\0') {
+        cmd.type = CMD_CARD_REMOVE;
+        if (!jsonStringField(s_cmdJson, "uid", cmd.uid, sizeof(cmd.uid))) {
             Serial.println(F("[CMD] card_remove: uid lipsa"));
             return;
         }
-        strncpy(command.uid, uid, sizeof(command.uid) - 1);
         Serial.print(F("[CMD] uid="));
-        Serial.println(command.uid);
-
+        Serial.println(cmd.uid);
     } else {
-        Serial.print(F("[CMD] necunoscut: "));
+        Serial.print(F("[CMD] necunoscuta: "));
         Serial.println(req);
         return;
     }
 
-    s_cmdCb(command);
+    s_cmdJson[0] = '\0';
+    s_cmdCallback(cmd);
 }
 
-// ============================================================
-//  nbiot_checkCommands() — citire non-blocanta + procesare
-//
-//  Apelati cat mai des in loop().
-//  Citeste prin modemRead() (rute +QMTRECV in cmdBuf).
-//  Proceseaza o comanda per apel cand linia e completa.
-// ============================================================
-void nbiot_checkCommands() {
-    modemRead();
-
-    if (!s_cmdReady) return;
-    s_cmdReady = false;
-
-    // Gaseste JSON-ul din linia +QMTRECV: 0,0,dev/cmd,{...}
-    // Format: +QMTRECV: <clientIdx>,<msgId>,<topic>,<payload>
-    char* jsonStart = strchr(s_cmdBuf, '{');
-    if (!jsonStart) {
-        // Linie incompleta sau fara JSON — reseteaza si asteapta mai mult
-        // Daca mai avem date, le pastram; daca nu, resetam
-        if (!strstr(s_cmdBuf, "+QMTRECV")) {
-            s_cmdPos = 0;
-            s_cmdBuf[0] = '\0';
-        }
-        return;
-    }
-
-    // Gaseste sfarsitul JSON-ului
-    char* jsonEnd = strrchr(jsonStart, '}');
-    if (!jsonEnd) {
-        // JSON incomplet — mai asteaptam date
-        // Daca bufferul e aproape plin, resetam
-        if (s_cmdPos >= CMD_BUF_SIZE - 5) {
-            Serial.println(F("[CMD] buf overflow, reset"));
-            s_cmdPos = 0;
-            s_cmdBuf[0] = '\0';
-        }
-        s_cmdReady = false;  // nu e gata, mai asteptam
-        return;
-    }
-
-    *(jsonEnd + 1) = '\0';  // termina dupa }
-
-    processCommand(jsonStart);
-
-    // Reset buffer dupa procesare
-    s_cmdPos = 0;
-    s_cmdBuf[0] = '\0';
+void nbiot_setCommandCallback(NbiotCommandCallback cb) {
+    s_cmdCallback = cb;
 }
 
-void nbiot_setCommandCallback(NbiotCommandCallback cb) { s_cmdCb = cb; }
+void nbiot_heartbeatTick(const char* stateStr) {
+    if (!s_connected || s_initState != INIT_DONE) return;
 
-bool nbiot_isConnected() { return s_connected; }
+    unsigned long now = millis();
+    if (now - s_lastHeartbeatMs >= NBIOT_HEARTBEAT_MS) {
+        s_lastHeartbeatMs = now;
+        nbiot_publish(EVT_SYSTEM_STATUS, "", stateStr);
+    }
+}
+
+bool nbiot_isConnected() {
+    return s_connected;
+}
