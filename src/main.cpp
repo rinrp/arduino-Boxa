@@ -56,7 +56,6 @@ static int g_prevReedRaw = -1;
 
 static bool g_remoteOpenPending = false;
 
-static unsigned long g_lastNbiotTickMs = 0;
 static unsigned long g_lastPublishAttemptMs = 0;
 static unsigned long g_lastHeartbeatQueueMs = 0;
 
@@ -173,14 +172,20 @@ static void onNbiotCommand(const NbiotCommand& cmd) {
 
         case CMD_CARD_ADD: {
             byte uid[4];
+            Serial.print(F("[CMD] card_add uid="));
+            Serial.println(cmd.uid);
             bool ok = cardmanager_parseUID(cmd.uid, uid) && cardmanager_add(uid);
+            Serial.println(ok ? F("[CMD] card add OK") : F("[CMD] card add failed"));
             queueEvent(ok ? EV_CARD_ADDED : EV_SYSTEM_STATUS, cmd.uid, g_state);
             break;
         }
 
         case CMD_CARD_REMOVE: {
             byte uid[4];
+            Serial.print(F("[CMD] card_remove uid="));
+            Serial.println(cmd.uid);
             bool ok = cardmanager_parseUID(cmd.uid, uid) && cardmanager_remove(uid);
+            Serial.println(ok ? F("[CMD] card removed OK") : F("[CMD] card remove failed"));
             queueEvent(ok ? EV_CARD_REMOVED : EV_SYSTEM_STATUS, cmd.uid, g_state);
             break;
         }
@@ -414,11 +419,11 @@ void loop() {
         }
     }
 
-    if (now - g_lastNbiotTickMs >= 250) {
-        g_lastNbiotTickMs = now;
-        nbiot_initTick();
-        nbiot_checkCommands();
-    }
+    // NB-IoT: initTick non-blocker + checkCommands la FIECARE iteratie
+    // Nu limitat la 250ms — SoftwareSerial buffer e mic (64 bytes)
+    // si +QMTRECV trebuie citit imediat ce soseste
+    nbiot_initTick();
+    nbiot_checkCommands();
 
     if (g_state != ALARM && now - g_lastHeartbeatQueueMs >= NBIOT_HEARTBEAT_MS) {
         g_lastHeartbeatQueueMs = now;

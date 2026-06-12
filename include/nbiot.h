@@ -3,7 +3,11 @@
 
 #include <Arduino.h>
 
+// ============================================================
 //  nbiot.h — Quectel BC92 + Orange Live Objects
+//  BUILD: MQTT_RX_NONBLOCKING_NO_LOSS
+// ============================================================
+
 #define LO_API_KEY       "4d248462f24c4f8d9a865c42019671bc"
 
 #define LO_DEVICE_ID     "RFID"
@@ -18,9 +22,13 @@
 #define LO_TOPIC_SUB     "dev/cmd"
 #define LO_TOPIC_CMD_RES "dev/cmd/res"
 
+// SMS fallback — seteaza 1 pentru activare
+#define ENABLE_SMS_FALLBACK 0
 #define LO_SMS_ADMIN_NR  "3523"
 
+// ============================================================
 //  Evenimente
+// ============================================================
 #define EVT_ACCESS_GRANTED   "access_granted"
 #define EVT_ACCESS_DENIED    "access_denied"
 #define EVT_DOOR_OPEN        "door_open"
@@ -32,8 +40,10 @@
 #define EVT_CARD_REMOVED     "card_removed"
 #define EVT_REMOTE_OPEN      "remote_open"
 
+// ============================================================
 //  Comenzi cloud
-enum NbiotCmd {
+// ============================================================
+enum NbiotCmd : byte {
     CMD_NONE,
     CMD_OPEN,
     CMD_CARD_ADD,
@@ -43,11 +53,14 @@ enum NbiotCmd {
 
 struct NbiotCommand {
     NbiotCmd type;
-    char uid[15];   // "CA:FD:A1:80"
+    char uid[15];   // "CA:FD:A1:80\0"
 };
 
 typedef void (*NbiotCommandCallback)(const NbiotCommand& cmd);
 
+// ============================================================
+//  API public
+// ============================================================
 bool nbiot_init();
 void nbiot_initTick();
 
@@ -55,9 +68,11 @@ void nbiot_publish(const char* eventType,
                    const char* uid,
                    const char* stateStr);
 
+// Citeste din SoftwareSerial si proceseaza comenzi.
+// Apelati cat mai des in loop() — non-blocker.
 void nbiot_checkCommands();
+
 void nbiot_setCommandCallback(NbiotCommandCallback cb);
-void nbiot_heartbeatTick(const char* stateStr);
 bool nbiot_isConnected();
 
 #define NBIOT_HEARTBEAT_MS 120000UL
